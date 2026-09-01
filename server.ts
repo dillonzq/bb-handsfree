@@ -144,7 +144,9 @@ export const rpcContract = defineRpcContract({
     output: z
       .object({
         plugins: z.array(
-          z.object({ id: z.string(), name: z.string(), summary: z.string() }).strict(),
+          z
+            .object({ id: z.string(), name: z.string(), summary: z.string(), iconUrl: z.string().nullable() })
+            .strict(),
         ),
       })
       .strict(),
@@ -175,9 +177,65 @@ export const rpcContract = defineRpcContract({
       .strict(),
     output: z.object({ ok: z.literal(true) }).strict(),
   },
+  /**
+   * Broadcast a live call's coarse presence to every surface/realm. The owning
+   * realm (the one holding the WebRTC session) publishes on each state change
+   * and on a heartbeat; other realms mirror it so their composer pill / sidebar
+   * bar reflect the call they don't own. Pure pass-through to realtime.
+   */
+  publishPresence: {
+    input: z
+      .object({
+        nonce: z.string().min(1),
+        phase: z.enum(["connecting", "live", "muted", "idle"]),
+        startedAt: z.number().nullable(),
+        /** Which client/realm owns this call (observability; see client-identity). */
+        client: z.string().optional(),
+        realm: z.string().optional(),
+      })
+      .strict(),
+    output: z.object({ ok: z.literal(true) }).strict(),
+  },
+  /**
+   * Ask whoever owns a live call to re-announce its presence right now. A
+   * freshly mounted surface (e.g. a page realm rebuilt after mobile navigation)
+   * fires this so it catches up immediately instead of waiting up to a full
+   * heartbeat — otherwise it briefly shows "idle" over a call that is live.
+   */
+  requestPresence: {
+    input: z.null(),
+    output: z.object({ ok: z.literal(true) }).strict(),
+  },
+  /**
+   * Relay a control intent (stop/mute/unmute) from a surface that does NOT own
+   * the call to the realm that does. Only the owner (matching nonce) acts on it.
+   */
+  sendVoiceCommand: {
+    input: z
+      .object({
+        nonce: z.string().min(1),
+        action: z.enum(["stop", "mute", "unmute"]),
+        /** Which client/realm issued the command (observability). */
+        client: z.string().optional(),
+        realm: z.string().optional(),
+      })
+      .strict(),
+    output: z.object({ ok: z.literal(true) }).strict(),
+  },
+  /**
+   * End a call authoritatively, without needing its owner realm to act — the
+   * owner may be a frozen, backgrounded mobile webview that can no longer receive
+   * commands. Marks the session stopped (so the list stops showing it live) and
+   * broadcasts idle + a stop so every surface clears and the owner tears down if
+   * it ever thaws. This is what makes stop reliable against the navigation zombie.
+   */
+  forceStop: {
+    input: z.object({ nonce: z.string().min(1) }).strict(),
+    output: z.object({ ok: z.literal(true) }).strict(),
+  },
   /** List voice sessions, newest first, with counts and estimated cost. */
   listSessions: {
-    input: z.null(),
+    input: z.object({ offset: z.number().int().min(0) }).strict().nullable(),
     output: z
       .object({
         sessions: z.array(
@@ -189,9 +247,22 @@ export const rpcContract = defineRpcContract({
               events: z.number(),
               ended: z.boolean(),
               costUsd: z.number(),
+              preview: z.string(),
+              hasError: z.boolean(),
+              /** Which device the call came through (from session.started); null for old sessions. */
+              device: z
+                .object({
+                  label: z.string(),
+                  mobile: z.boolean(),
+                  platform: z.string(),
+                  browser: z.string(),
+                  runtime: z.string(),
+                })
+                .nullable(),
             })
             .strict(),
         ),
+        hasMore: z.boolean(),
       })
       .strict(),
   },
@@ -834,8 +905,23 @@ export default async function plugin(bb: BbPluginApi) {
           prompt,
           ...(typeof args.title === "string" && args.title ? { title: args.title } : {}),
         });
-        await bb.sdk.threads.open({ threadId: thread.id, file: null }).catch(() => undefined);
-        return JSON.stringify({ started: (await withMachines([describeThread(thread)]))[0] });
+        // `threads.open` navigates every connected window — which backgrounds a
+        // live mobile call (and yanks other windows). The client sets focus:false
+        // when it must not navigate; the thread still spawns and runs.
+        const shouldFocus = args.focus !== false;
+        if (shouldFocus) {
+          await bb.sdk.threads.open({ threadId: thread.id, file: null }).catch(() => undefined);
+        }
+        const started = (await withMachines([describeThread(thread)]))[0];
+        return JSON.stringify(
+          shouldFocus
+            ? { started }
+            : {
+                started,
+                focused: false,
+                note: "Started and running, but NOT brought on screen (that would drop the live call on this phone). Tell the user in one short sentence that it's running and they can tap it in the thread list.",
+              },
+        );
       }
       case "stop_thread": {
         await bb.sdk.threads.stop({ threadId: str("thread_id") });
@@ -903,7 +989,13 @@ export default async function plugin(bb: BbPluginApi) {
             ? { environmentId, target: "all", mergeBaseBranch }
             : { environmentId, target: "uncommitted" },
         );
-        await bb.sdk.threads.open({ threadId, file: null }).catch(() => undefined);
+        // Like start_thread, show_diff both computes something useful AND
+        // navigates (threads.open). Skip the navigation when the client asks
+        // (focus:false) so a live mobile call isn't backgrounded — the diff
+        // summary is still returned either way.
+        if (args.focus !== false) {
+          await bb.sdk.threads.open({ threadId, file: null }).catch(() => undefined);
+        }
         if (diff.outcome !== "available") return `Diff not available (${diff.outcome}).`;
         const files = diff.files.map((f) => ({ path: f.path, additions: f.additions, deletions: f.deletions }));
         return JSON.stringify({ shortstat: diff.shortstat, files: files.slice(0, 50) });
@@ -1108,6 +1200,7 @@ export default async function plugin(bb: BbPluginApi) {
               id: plugin.id,
               name: plugin.cliCommand?.name ?? plugin.id,
               summary: plugin.cliCommand?.summary ?? "",
+              iconUrl: plugin.iconUrl ?? null,
             }))
             .sort((a, b) => a.name.localeCompare(b.name)),
         };
@@ -1136,9 +1229,15 @@ export default async function plugin(bb: BbPluginApi) {
       db.prepare(
         "INSERT INTO session_events (session_id, ts, kind, payload) VALUES (?, ?, ?, ?)",
       ).run(sessionId, Date.now(), kind, JSON.stringify(payload));
-      // Mirror audio-device diagnostics to the plugin log so `bb plugin logs
-      // handsfree` surfaces mic/speaker problems without opening the DB.
-      if (kind.startsWith("audio.")) {
+      // Mirror audio/mic lifecycle diagnostics to the plugin log so `bb plugin
+      // logs handsfree` surfaces mic/speaker/backgrounding problems (HF-2)
+      // without opening the DB.
+      if (
+        kind.startsWith("audio.") ||
+        kind.startsWith("mic.") ||
+        kind.startsWith("page.") ||
+        kind.startsWith("client.")
+      ) {
         const detail = JSON.stringify(payload);
         if (kind.endsWith(".failed")) bb.log.error(`${kind} ${detail}`);
         else bb.log.info(`${kind} ${detail}`);
@@ -1146,25 +1245,102 @@ export default async function plugin(bb: BbPluginApi) {
       bb.realtime.publish("aide-log", { sessionId });
       return { ok: true as const };
     },
-    async listSessions() {
+    async publishPresence({ nonce, phase, startedAt, client, realm }) {
+      bb.realtime.publish("voice-presence", { nonce, phase, startedAt, client, realm });
+      return { ok: true as const };
+    },
+    async requestPresence() {
+      bb.realtime.publish("voice-presence-query", {});
+      return { ok: true as const };
+    },
+    async sendVoiceCommand({ nonce, action, client, realm }) {
+      bb.realtime.publish("voice-command", { nonce, action, client, realm });
+      return { ok: true as const };
+    },
+    async forceStop({ nonce }) {
+      // Durable end-marker so listSessions stops showing it live even if the
+      // owner realm never logs its own session.stopped (count > 0 is enough).
+      db.prepare(
+        "INSERT INTO session_events (session_id, ts, kind, payload) VALUES (?, ?, ?, ?)",
+      ).run(nonce, Date.now(), "session.stopped", JSON.stringify({ _forced: true }));
+      bb.realtime.publish("voice-presence", { nonce, phase: "idle", startedAt: null });
+      bb.realtime.publish("voice-command", { nonce, action: "stop" });
+      bb.realtime.publish("aide-log", { sessionId: nonce });
+      return { ok: true as const };
+    },
+    async listSessions(input) {
+      // Page through grouped sessions newest-first. Fetch one extra row past the
+      // page to tell the client whether a "Load more" is worthwhile, then drop it.
+      const pageSize = 30;
+      const offset = input?.offset ?? 0;
       const rows = db
         .prepare(
           `SELECT session_id AS id, MIN(ts) AS startedAt, MAX(ts) AS lastEventAt, COUNT(*) AS events,
                   SUM(CASE WHEN kind = 'session.stopped' THEN 1 ELSE 0 END) AS stopped
-           FROM session_events GROUP BY session_id ORDER BY startedAt DESC LIMIT 100`,
+           FROM session_events GROUP BY session_id ORDER BY startedAt DESC LIMIT ? OFFSET ?`,
         )
-        .all() as { id: string; startedAt: number; lastEventAt: number; events: number; stopped: number }[];
+        .all(pageSize + 1, offset) as { id: string; startedAt: number; lastEventAt: number; events: number; stopped: number }[];
+      const hasMore = rows.length > pageSize;
+      const page = hasMore ? rows.slice(0, pageSize) : rows;
       const costStmt = db.prepare("SELECT * FROM usage_events WHERE session_id = ?");
+      // First thing the user said, as a scannable preview; fall back to Aide's
+      // opening line so a row is never blank.
+      const previewStmt = db.prepare(
+        "SELECT payload FROM session_events WHERE session_id = ? AND kind IN ('user', 'assistant') ORDER BY (kind = 'assistant'), ts, id LIMIT 1",
+      );
+      const errorStmt = db.prepare(
+        "SELECT 1 FROM session_events WHERE session_id = ? AND kind = 'error' LIMIT 1",
+      );
+      const deviceStmt = db.prepare(
+        "SELECT payload FROM session_events WHERE session_id = ? AND kind = 'session.started' ORDER BY ts LIMIT 1",
+      );
+      const device = (sessionId: string) => {
+        const found = deviceStmt.get(sessionId) as { payload: string } | undefined;
+        if (!found) return null;
+        try {
+          const d = (JSON.parse(found.payload) as { device?: unknown }).device;
+          if (!d || typeof d !== "object") return null;
+          const o = d as Record<string, unknown>;
+          return {
+            label: String(o.label ?? ""),
+            mobile: Boolean(o.mobile),
+            platform: String(o.platform ?? ""),
+            browser: String(o.browser ?? ""),
+            runtime: String(o.runtime ?? ""),
+          };
+        } catch {
+          return null;
+        }
+      };
+      const preview = (sessionId: string): string => {
+        const found = previewStmt.get(sessionId) as { payload: string } | undefined;
+        if (!found) return "";
+        try {
+          const text = (JSON.parse(found.payload) as { text?: unknown }).text;
+          return typeof text === "string" ? text.slice(0, 140) : "";
+        } catch {
+          return "";
+        }
+      };
       return {
-        sessions: rows.map((row) => ({
+        hasMore,
+        sessions: page.map((row) => ({
           id: row.id,
           startedAt: row.startedAt,
           lastEventAt: row.lastEventAt,
           events: row.events,
-          ended: row.stopped > 0,
+          // Ended if it logged session.stopped, OR it went quiet long ago: a
+          // call that dies uncleanly (page unload, torn-down WebRTC on
+          // navigation, app killed on mobile) never logs session.stopped, so
+          // without this stale check every crashed session shows "live" forever.
+          // The active window overrides this to keep a genuinely live call live.
+          ended: row.stopped > 0 || Date.now() - row.lastEventAt > 300_000,
           costUsd: Number(
             (costStmt.all(row.id) as UsageRow[]).reduce((sum, usage) => sum + costUsd(usage), 0).toFixed(4),
           ),
+          preview: preview(row.id),
+          hasError: errorStmt.get(row.id) !== undefined,
+          device: device(row.id),
         })),
       };
     },

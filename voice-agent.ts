@@ -1,6 +1,8 @@
-// The app-global voice session singleton. Lives in its own module so both
-// the composer button (app.tsx) and the Handsfree page (sessions-panel.tsx)
-// can control one shared session without a circular import.
+// The voice session singleton for a plugin realm. Lives in its own module so
+// both the composer button (app.tsx) and the Handsfree page (sessions-panel.tsx)
+// can reach it without a circular import. Note: bb renders each surface in a
+// separate realm, so this is one instance PER surface; cross-surface state is
+// shared over realtime presence/command channels (see VoiceAgent below).
 import { toast } from "sonner";
 import type { useRpc } from "@get-bb/plugin-sdk/app";
 import type { rpcContract } from "./server";
@@ -13,10 +15,52 @@ import {
   writeAudioDevicePreferences,
   type AudioDevicePreferences,
 } from "./audio-devices.ts";
+import { clientId, realmId, identityTag, clientDescriptor, deviceSummary } from "./client-identity.ts";
 
 export type VoiceState = "idle" | "connecting" | "live" | "muted";
 /** Who currently has the floor during a live call, for the "listening" UI. */
 export type VoiceActivity = "you" | "aide" | "idle";
+/** A control intent relayed from a non-owning surface to the owning realm. */
+export type VoiceCommandAction = "stop" | "mute" | "unmute";
+
+/**
+ * A live call owned by another surface's realm, mirrored here from the
+ * `voice-presence` broadcast so this realm's controls reflect it. `receivedAt`
+ * lets us expire a call whose owner realm vanished without a clean stop.
+ */
+interface RemotePresence {
+  nonce: string;
+  phase: Exclude<VoiceState, "idle">;
+  startedAt: number | null;
+  receivedAt: number;
+  /** Which client/realm owns the mirrored call (observability / future "live on X"). */
+  ownerClient?: string;
+  ownerRealm?: string;
+}
+
+/**
+ * Tools measured to background the owner realm on mobile (→ iOS suspends the mic
+ * → the call dies), so they're refused during a live mobile call. Verified on
+ * 2026-09-01: `focus_thread` backgrounds the app; `set_pane` and `start_thread`
+ * do NOT. This is the correctness-optimization list; if a new/other tool ever
+ * backgrounds us anyway, `mic.suspend.teardown {cause}` names it in the logs and
+ * the call still ends cleanly — so this list can stay small and be extended from
+ * evidence, not guesswork.
+ */
+const MOBILE_NAV_TOOLS = new Set(["focus_thread"]);
+
+/**
+ * Tools that do real work AND navigate (spawn/diff, then `bb.sdk.threads.open`).
+ * Unlike a pure-navigation tool we don't refuse these — we run them with
+ * `focus:false` on a live mobile call so the work happens without backgrounding
+ * the call. The server honors the flag by skipping its `threads.open`.
+ */
+const FOCUS_SUPPRESSIBLE_TOOLS = new Set(["start_thread", "show_diff"]);
+
+/** A mirror is stale (owner realm likely gone) after two missed heartbeats. */
+const PRESENCE_STALE_MS = 25_000;
+/** How often the owning realm re-announces a live call, for the mirror above. */
+const PRESENCE_HEARTBEAT_MS = 10_000;
 
 interface RpcClient {
   call: ReturnType<typeof useRpc<typeof rpcContract>>["call"];
@@ -35,7 +79,12 @@ export interface Bindings {
     /** True when the user is on the New thread screen (no thread exists yet). */
     onNewThreadScreen: boolean;
   };
-  composer: ComposerBinding;
+  /**
+   * The composer to type into — present only when a composer surface is mounted
+   * (e.g. a thread view). Absent on surfaces like the Handsfree page, where the
+   * text tools report that no composer is focused rather than faking one.
+   */
+  composer?: ComposerBinding;
   openNewThread: (projectId: string | null) => void;
 }
 
@@ -44,6 +93,22 @@ interface SessionHandle {
   stream: MediaStream;
   audio: HTMLAudioElement;
   dc: RTCDataChannel | null;
+  /** The live mic track feeding the pc; swapped in when iOS suspends the mic. */
+  micTrack: MediaStreamTrack | null;
+  /** The pc's audio sender, so a fresh mic track can replace a suspended one. */
+  micSender: RTCRtpSender | null;
+  /** Tears down the page/visibility listeners installed for this session. */
+  disposeLifecycle?: () => void;
+}
+
+/**
+ * Detach a timer from the event loop where the runtime supports it (Node's
+ * `unref`). No-op in the browser (timer ids have no `unref`), where it isn't
+ * needed — this just keeps background presence timers from holding a process
+ * (e.g. tests) open.
+ */
+function maybeUnref(timer: ReturnType<typeof setInterval>) {
+  (timer as { unref?: () => void }).unref?.();
 }
 
 function browserStorage(): Storage | null {
@@ -72,9 +137,15 @@ function waitForIceGathering(pc: RTCPeerConnection, timeoutMs = 2000): Promise<v
 }
 
 /**
- * App-global voice session. Mounted buttons keep `bindings` fresh (latest
- * composer + route context win), so tool calls always act on what the user
- * is currently looking at, and navigation never interrupts the call.
+ * Voice session for one plugin realm. bb renders each surface (composer,
+ * sidebar, the Handsfree page) in its own JS realm, so this singleton is
+ * per-surface, not truly app-global: the realm that starts a call OWNS the
+ * WebRTC session; the call keeps running there as the user navigates within
+ * that realm. Other realms don't hold the session — they mirror its coarse
+ * state over the `voice-presence` broadcast and relay stop/mute back to the
+ * owner via `voice-command`, so every surface reflects and can control the one
+ * live call. Mounted buttons keep `bindings` fresh (latest composer + route
+ * context win) so tool calls act on what the user is currently looking at.
  */
 export class VoiceAgent {
   private state: VoiceState = "idle";
@@ -109,16 +180,74 @@ export class VoiceAgent {
   private connectTimer: ReturnType<typeof setTimeout> | null = null;
   /** When the call first went live (ms), for elapsed-duration UI; null if not. */
   private liveStartedAt: number | null = null;
+  /**
+   * True while the OS has suspended the mic (typically iOS backgrounding the
+   * owning realm). The uplink is dead until recovered — surfaced honestly rather
+   * than leaving the call looking "Connected" while Aide can't hear you.
+   */
+  private micSuspended = false;
+  /** The most recent meaningful event, for the dock's live activity ticker. */
+  private lastActivity: { kind: string; name: string; text: string } | null = null;
+  /**
+   * A call owned by another surface's realm, mirrored from `voice-presence`.
+   * Non-null only when THIS realm does not own the call; drives the effective
+   * getters so every surface reflects the one live call. Null when we own it.
+   */
+  private remotePresence: RemotePresence | null = null;
+  /** Re-announces our live call so other realms' mirrors don't go stale. */
+  private presenceTimer: ReturnType<typeof setInterval> | null = null;
+  /** Expires a stale mirror (owner realm gone) so we never show a ghost call. */
+  private remoteExpiryTimer: ReturnType<typeof setInterval> | null = null;
+  /** Guards the once-per-realm `client.hello` observability record. */
+  private helloed = false;
+  /** The most recent tool call, so a suspend/teardown can name its likely cause. */
+  private lastTool: { name: string; at: number } | null = null;
 
   readonly subscribe = (listener: () => void): (() => void) => {
     this.listeners.add(listener);
     return () => this.listeners.delete(listener);
   };
 
-  readonly getState = (): VoiceState => this.state;
+  /**
+   * The effective call state for the UI: our own if we own a call, otherwise a
+   * call mirrored from another surface's realm (`voice-presence`). This is what
+   * makes every surface reflect the single live call, not just the one that
+   * started it.
+   */
+  readonly getState = (): VoiceState =>
+    this.state !== "idle" ? this.state : this.remotePresenceLive()?.phase ?? "idle";
 
   /** Epoch ms when the call went live, or null when not in a live/muted call. */
-  readonly getLiveStartedAt = (): number | null => this.liveStartedAt;
+  readonly getLiveStartedAt = (): number | null =>
+    this.state !== "idle" ? this.liveStartedAt : this.remotePresenceLive()?.startedAt ?? null;
+
+  /**
+   * The active session id (the call nonce, which doubles as the session id used
+   * when logging events), or null when idle. Lets the page jump straight to the
+   * live session's transcript — including a call owned by another surface.
+   */
+  readonly getSessionId = (): string | null =>
+    this.state !== "idle" ? this.nonce : this.remotePresenceLive()?.nonce ?? null;
+
+  /** True while THIS realm owns (or is opening) the call. */
+  private hasLocalCall(): boolean {
+    return this.state !== "idle";
+  }
+
+  /** The mirrored remote call if still fresh; null once its heartbeats lapse. */
+  private remotePresenceLive(): RemotePresence | null {
+    const remote = this.remotePresence;
+    if (!remote) return null;
+    if (Date.now() - remote.receivedAt > PRESENCE_STALE_MS) return null;
+    return remote;
+  }
+
+  /**
+   * The latest meaningful event (speech / tool call / notice), for the dock's
+   * activity ticker. Stable identity between changes so it's safe for
+   * useSyncExternalStore. The UI owns human phrasing (tool → verb).
+   */
+  readonly getLastActivity = (): { kind: string; name: string; text: string } | null => this.lastActivity;
 
   /**
    * Who is talking right now, from the data-channel signals we already track
@@ -132,6 +261,20 @@ export class VoiceAgent {
     if (this.assistantSpeaking) return "aide";
     return "idle";
   };
+
+  /**
+   * True when THIS realm owns a call whose mic the OS has suspended — the
+   * uplink is down (Aide can't hear you) until it comes back to the foreground
+   * and recovers. Only meaningful for the owner; mirrors don't hold the mic.
+   */
+  readonly getMicSuspended = (): boolean =>
+    this.micSuspended && (this.state === "live" || this.state === "muted");
+
+  private setMicSuspended(value: boolean) {
+    if (this.micSuspended === value) return;
+    this.micSuspended = value;
+    this.emitChange();
+  }
 
   private setUserSpeaking(value: boolean) {
     if (this.userSpeaking === value) return;
@@ -155,15 +298,212 @@ export class VoiceAgent {
 
   bind(bindings: Bindings) {
     this.bindings = bindings;
+    this.helloOnce("composer");
+  }
+
+  /**
+   * Bind a surface only if nothing is bound yet. The Handsfree page uses this so
+   * a call can be started with no composer mounted (its FAB), without clobbering
+   * the richer binding a real composer installs — a live composer's text tools
+   * must keep targeting that composer, not the page's new-thread fallback.
+   */
+  bindFallback(bindings: Bindings) {
+    if (!this.bindings) this.bindings = bindings;
+    this.helloOnce("page");
+  }
+
+  /**
+   * Announce this realm once it can talk to the backend, so every surface (even
+   * idle ones that never start a call) leaves a durable record of its client +
+   * realm id, the device descriptor, and which surface it is. This is how we
+   * enumerate "which realms exist on which client, and what kind of device".
+   */
+  private helloOnce(surface: string) {
+    if (this.helloed || !this.bindings) return;
+    this.helloed = true;
+    this.logDiag("client.hello", {
+      surface, // realm/usage: which surface this realm is (composer vs page)
+      visibility: typeof document !== "undefined" ? document.visibilityState : "unknown",
+      ...clientDescriptor, // client/device: platform, browser, runtime, ua, …
+    });
   }
 
   private setState(next: VoiceState) {
     this.state = next;
     this.emitChange();
+    // Announce our own transitions so other realms mirror this call. Idle is
+    // announced explicitly by stop() (which clears the nonce first), so skip it
+    // here — a null nonce has nothing to identify.
+    if (next !== "idle" && this.nonce) this.broadcastPresence(next, this.nonce);
   }
 
   private emitChange() {
     for (const listener of this.listeners) listener();
+  }
+
+  // ---- cross-surface presence (see server: voice-presence / voice-command) ----
+
+  /**
+   * Announce our own call so other realms mirror it. Fire-and-forget; presence
+   * is cosmetic, so a failed publish must never touch the call. Only our own
+   * transitions reach here (setState / stop), so `nonce` always identifies us.
+   */
+  private broadcastPresence(phase: VoiceState, nonce: string) {
+    const rpc = this.bindings?.rpc;
+    if (!rpc) return;
+    void rpc
+      .call("publishPresence", { nonce, phase, startedAt: this.liveStartedAt, client: clientId, realm: realmId })
+      .catch(() => undefined);
+  }
+
+  /**
+   * Ask any realm that owns a live call to re-announce it now. A surface calls
+   * this on mount so it catches up immediately instead of waiting up to a full
+   * heartbeat — the "briefly shows Talk to Aide over a live call" gap.
+   */
+  requestPresence() {
+    const rpc = this.bindings?.rpc;
+    if (!rpc) return;
+    void rpc.call("requestPresence", null).catch(() => undefined);
+  }
+
+  /** Re-announce our call in response to a peer's mount-time presence request. */
+  answerPresenceQuery() {
+    if (this.nonce && this.hasLocalCall()) this.broadcastPresence(this.state, this.nonce);
+  }
+
+  /** Keep remote mirrors fresh while we own a live call (see PRESENCE_STALE_MS). */
+  private startPresenceHeartbeat() {
+    this.stopPresenceHeartbeat();
+    this.presenceTimer = setInterval(() => {
+      if (this.nonce && this.hasLocalCall()) this.broadcastPresence(this.state, this.nonce);
+    }, PRESENCE_HEARTBEAT_MS);
+    maybeUnref(this.presenceTimer);
+  }
+
+  private stopPresenceHeartbeat() {
+    if (this.presenceTimer) clearInterval(this.presenceTimer);
+    this.presenceTimer = null;
+  }
+
+  /**
+   * Ingest a `voice-presence` broadcast. Ignores our own echo and anything while
+   * we own a call (our local state already drives the UI); otherwise mirrors the
+   * remote call so this realm's controls reflect it.
+   */
+  ingestPresence(payload: unknown) {
+    const p = payload as
+      | { nonce?: unknown; phase?: unknown; startedAt?: unknown; client?: unknown; realm?: unknown }
+      | null;
+    const nonce = typeof p?.nonce === "string" ? p.nonce : null;
+    // Never mirror our own broadcast. Match on realm too, not just nonce: after
+    // stop() nulls the nonce, a reordered trailing "live" frame from this realm
+    // would otherwise slip past the nonce check and ghost as a remote call.
+    if (!nonce || nonce === this.nonce || p?.realm === realmId || this.hasLocalCall()) return;
+    const phase = p?.phase;
+    if (phase === "idle") {
+      // Only the call we're actually mirroring can clear it — a late idle for an
+      // older, already-superseded call must not wipe a newer live mirror.
+      if (this.remotePresence?.nonce === nonce) {
+        this.remotePresence = null;
+        this.disarmRemoteExpiry();
+        this.emitChange();
+      }
+      return;
+    }
+    if (phase !== "connecting" && phase !== "live" && phase !== "muted") return;
+    const startedAt = typeof p?.startedAt === "number" ? p.startedAt : null;
+    const ownerClient = typeof p?.client === "string" ? p.client : undefined;
+    const ownerRealm = typeof p?.realm === "string" ? p.realm : undefined;
+    this.remotePresence = { nonce, phase, startedAt, receivedAt: Date.now(), ownerClient, ownerRealm };
+    this.armRemoteExpiry();
+    this.emitChange();
+  }
+
+  /** Poll a mirror to expiry so a vanished owner doesn't leave a ghost "live". */
+  private armRemoteExpiry() {
+    if (this.remoteExpiryTimer) return;
+    this.remoteExpiryTimer = setInterval(() => {
+      if (!this.remotePresence) {
+        this.disarmRemoteExpiry();
+        return;
+      }
+      if (this.remotePresenceLive()) return; // still fresh
+      this.remotePresence = null;
+      this.disarmRemoteExpiry();
+      this.emitChange();
+    }, 5000);
+    maybeUnref(this.remoteExpiryTimer);
+  }
+
+  private disarmRemoteExpiry() {
+    if (this.remoteExpiryTimer) clearInterval(this.remoteExpiryTimer);
+    this.remoteExpiryTimer = null;
+  }
+
+  /** Relay a control intent to whichever realm owns the call. */
+  private sendCommand(nonce: string, action: VoiceCommandAction) {
+    const rpc = this.bindings?.rpc;
+    if (!rpc) return;
+    void rpc
+      .call("sendVoiceCommand", { nonce, action, client: clientId, realm: realmId })
+      .catch(() => undefined);
+  }
+
+  /**
+   * End a call server-authoritatively, so it works even when the owner realm is
+   * a frozen/backgrounded mobile webview that can't receive commands — the fix
+   * for the navigation zombie. Fire-and-forget; cosmetic on failure.
+   */
+  private forceStop(nonce: string) {
+    const rpc = this.bindings?.rpc;
+    if (!rpc) return;
+    void rpc.call("forceStop", { nonce }).catch(() => undefined);
+  }
+
+  /** Stop a call we only mirror: force-stop on the server + drop the mirror now. */
+  private stopRemote(nonce: string) {
+    this.forceStop(nonce);
+    if (this.remotePresence?.nonce === nonce) {
+      this.remotePresence = null;
+      this.disarmRemoteExpiry();
+      this.emitChange();
+    }
+  }
+
+  /** Apply a relayed command — but only if THIS realm owns that call. */
+  applyVoiceCommand(payload: unknown) {
+    const p = payload as { nonce?: unknown; action?: unknown } | null;
+    const nonce = typeof p?.nonce === "string" ? p.nonce : null;
+    if (!nonce || nonce !== this.nonce || !this.hasLocalCall()) return;
+    const action = p?.action;
+    if (action === "stop") this.stop();
+    else if (action === "mute") this.setMuted(true);
+    else if (action === "unmute") this.setMuted(false);
+  }
+
+  // ---- surface controls: act on the local call, or relay to the owner ----
+
+  /** Start/stop from any surface. A mirrored remote call is stopped, not toggled. */
+  toggleFromSurface() {
+    if (this.hasLocalCall()) return this.toggle();
+    const remote = this.remotePresenceLive();
+    if (remote) return this.stopRemote(remote.nonce);
+    void this.start();
+  }
+
+  /** Mute/unmute from any surface. */
+  toggleMuteFromSurface() {
+    if (this.hasLocalCall()) return this.toggleMute();
+    const remote = this.remotePresenceLive();
+    if (remote) this.sendCommand(remote.nonce, remote.phase === "muted" ? "unmute" : "mute");
+  }
+
+  /** Stop from any surface — server-authoritative for a call we only mirror. */
+  stopFromSurface() {
+    if (this.hasLocalCall()) return this.stop();
+    const remote = this.remotePresenceLive();
+    if (remote) this.stopRemote(remote.nonce);
   }
 
   setAudioPreferences(next: AudioDevicePreferences) {
@@ -282,7 +622,23 @@ export class VoiceAgent {
     const sessionId = this.nonce;
     const bindings = this.bindings;
     if (!sessionId || !bindings) return;
-    void bindings.rpc.call("logEvent", { sessionId, kind, payload }).catch(() => undefined);
+    this.noteActivity(kind, payload);
+    // Stamp which client/realm produced this event (see client-identity.ts) so
+    // the transcript/DB shows where things actually happened across surfaces.
+    void bindings.rpc
+      .call("logEvent", { sessionId, kind, payload: { ...payload, _id: identityTag() } })
+      .catch(() => undefined);
+  }
+
+  /** Track the latest meaningful event for the dock ticker (ignores diagnostics). */
+  private noteActivity(kind: string, payload: Record<string, unknown>) {
+    let next: { kind: string; name: string; text: string } | null;
+    if (kind === "session.started") next = null;
+    else if (kind === "user" || kind === "assistant" || kind === "notice") next = { kind, name: "", text: String(payload.text ?? "") };
+    else if (kind === "tool.call") next = { kind, name: String(payload.name ?? ""), text: "" };
+    else return; // diagnostics / tool.result don't move the ticker
+    this.lastActivity = next;
+    this.emitChange();
   }
 
   /**
@@ -295,15 +651,148 @@ export class VoiceAgent {
     const rpc = this.bindings?.rpc;
     if (!rpc) return;
     void rpc
-      .call("logEvent", { sessionId: this.nonce ?? "audio-diagnostics", kind, payload })
+      .call("logEvent", {
+        sessionId: this.nonce ?? "audio-diagnostics",
+        kind,
+        payload: { ...payload, _id: identityTag() },
+      })
       .catch(() => undefined);
+  }
+
+  // ---- audio lifecycle: keep inbound audio playing and the mic alive across
+  // navigation/backgrounding (see HF-2). Everything here is defensive; a browser
+  // without DOM (tests) simply skips the DOM/track wiring.
+
+  /** Inline playback + in-DOM element: the reliable iOS shape for WebRTC audio. */
+  private prepareAudioElement(audio: HTMLAudioElement) {
+    (audio as HTMLAudioElement & { playsInline?: boolean }).playsInline = true;
+    if (typeof document === "undefined") return;
+    try {
+      audio.setAttribute("playsinline", "");
+      audio.style.display = "none";
+      document.body.appendChild(audio);
+    } catch {
+      /* no DOM to attach to — inbound audio still plays via srcObject */
+    }
+  }
+
+  /**
+   * Watch a mic track for OS suspension. iOS mutes (and sometimes ends) the mic
+   * track when it backgrounds the owning realm; `enabled=false` from our own
+   * mute does NOT fire these, so `mute` here always means the source stopped.
+   */
+  private attachMicLifecycle(session: SessionHandle, track: MediaStreamTrack) {
+    track.onmute = () => {
+      if (this.session !== session) return;
+      const hidden = typeof document !== "undefined" && document.visibilityState === "hidden";
+      // Name the tool that ran just before this, so a suspension caused by a
+      // navigation tool we haven't classified yet is self-reporting in the logs.
+      const cause =
+        this.lastTool && Date.now() - this.lastTool.at < 4000 ? this.lastTool.name : null;
+      this.logDiag("mic.track.muted", { hidden, cause });
+      if (hidden) {
+        // Backgrounded on mobile: the mic is gone and this realm is about to
+        // freeze. End cleanly NOW (while the handler still runs) and enforce it
+        // server-side, so it never becomes an unstoppable zombie.
+        this.logDiag("mic.suspend.teardown", { cause });
+        this.endBecauseSuspended();
+      } else {
+        // Mic muted while visible (another app grabbed it, glitch): try to heal.
+        this.setMicSuspended(true);
+        void this.recoverMicIfNeeded(session);
+      }
+    };
+    track.onunmute = () => {
+      if (this.session !== session) return;
+      this.logDiag("mic.track.unmuted", {});
+      this.setMicSuspended(false); // OS resumed the same track — uplink is back
+    };
+    track.onended = () => {
+      if (this.session !== session) return;
+      this.logDiag("mic.track.ended", {});
+      this.setMicSuspended(true);
+      void this.recoverMicIfNeeded(session);
+    };
+  }
+
+  /**
+   * End a call because the OS suspended its mic while backgrounded (mobile).
+   * Force-stops server-side FIRST (so the end survives even if this realm freezes
+   * a beat later), then tears down locally. This is the honest alternative to a
+   * silent one-way zombie: the call ends and every surface goes idle.
+   */
+  private endBecauseSuspended() {
+    const nonce = this.nonce;
+    toast.info("Aide: call ended — the app moved to the background");
+    if (nonce) this.forceStop(nonce);
+    this.stop();
+  }
+
+  /** On returning to the foreground, try to revive a suspended mic. */
+  private attachPageLifecycle(session: SessionHandle) {
+    if (typeof document === "undefined") return;
+    const onVisibility = () => {
+      if (this.session !== session) return;
+      this.logDiag("page.visibility", { state: document.visibilityState });
+      if (document.visibilityState === "visible") void this.recoverMicIfNeeded(session);
+    };
+    document.addEventListener("visibilitychange", onVisibility);
+    session.disposeLifecycle = () => document.removeEventListener("visibilitychange", onVisibility);
+  }
+
+  /**
+   * Replace a dead/suspended mic track with a fresh one, keeping the same pc and
+   * realtime session (replaceTrack needs no renegotiation). Only attempts in the
+   * foreground — iOS blocks getUserMedia while backgrounded. A no-op when the mic
+   * is already healthy.
+   */
+  private async recoverMicIfNeeded(session: SessionHandle) {
+    if (this.session !== session) return;
+    const sender = session.micSender;
+    const track = session.micTrack;
+    if (!sender) return;
+    if (track && track.readyState === "live" && !track.muted) {
+      this.setMicSuspended(false); // already healthy
+      return;
+    }
+    if (typeof document !== "undefined" && document.visibilityState !== "visible") return;
+    this.logDiag("mic.recover.attempt", { readyState: track?.readyState ?? null, muted: track?.muted ?? null });
+    try {
+      const fresh = await this.acquireMic(this.audioPreferences.inputDeviceId);
+      if (this.session !== session) {
+        for (const t of fresh.getTracks()) t.stop();
+        return;
+      }
+      const newTrack = fresh.getAudioTracks()[0];
+      if (!newTrack) throw new Error("no audio track");
+      newTrack.enabled = this.state !== "muted"; // preserve the user's mute
+      await sender.replaceTrack(newTrack);
+      // Detach the old track's lifecycle handlers before stopping it — otherwise
+      // its onended fires (session still current) and re-enters suspend/recover,
+      // flashing a false "mic paused".
+      if (session.micTrack) {
+        session.micTrack.onmute = null;
+        session.micTrack.onunmute = null;
+        session.micTrack.onended = null;
+        session.micTrack.stop();
+      }
+      session.micTrack = newTrack;
+      this.attachMicLifecycle(session, newTrack);
+      this.setMicSuspended(false);
+      this.logDiag("mic.recover.ok", {});
+    } catch (error) {
+      this.logDiag("mic.recover.failed", { name: error instanceof Error ? error.name : "unknown" });
+    }
   }
 
   /** Mute = mic track sends silence; the call and playback stay up. */
   setMuted(muted: boolean) {
     const session = this.session;
     if (!session || (this.state !== "live" && this.state !== "muted")) return;
-    for (const track of session.stream.getAudioTracks()) track.enabled = !muted;
+    // Prefer the tracked mic track — recovery may have replaced it with one that
+    // is no longer part of the original getUserMedia stream.
+    if (session.micTrack) session.micTrack.enabled = !muted;
+    else for (const track of session.stream.getAudioTracks()) track.enabled = !muted;
     this.log(muted ? "muted" : "unmuted");
     this.setUserSpeaking(false); // a muted mic can't be mid-utterance
     this.setState(muted ? "muted" : "live");
@@ -390,8 +879,10 @@ export class VoiceAgent {
   }
 
   stop() {
+    const endedNonce = this.nonce;
     if (this.session) this.log("session.stopped");
     this.clearConnectWatchdog();
+    this.stopPresenceHeartbeat();
     this.liveStartedAt = null;
     const session = this.session;
     this.session = null;
@@ -404,14 +895,20 @@ export class VoiceAgent {
     if (this.noticeTimer) clearTimeout(this.noticeTimer);
     this.noticeTimer = null;
     this.setUserSpeaking(false);
+    this.setMicSuspended(false);
     if (session) {
+      session.disposeLifecycle?.();
       session.dc?.close();
       session.pc.close();
       for (const track of session.stream.getTracks()) track.stop();
+      session.micTrack?.stop(); // a recovered track lives outside stream
       session.audio.srcObject = null;
       session.audio.remove();
     }
     this.setState("idle");
+    // Clear every mirror now that the call is over. Done after nulling nonce so
+    // setState's own broadcast is skipped and this is the single idle announce.
+    if (endedNonce) this.broadcastPresence("idle", endedNonce);
   }
 
   private async handleToolCall(dc: RTCDataChannel, event: Record<string, unknown>) {
@@ -425,16 +922,25 @@ export class VoiceAgent {
       /* keep {} */
     }
     this.log("tool.call", { name, args });
+    this.lastTool = { name, at: Date.now() };
     let output: string;
     if (!bindings) {
       output = "Tool error: no bb surface is bound right now.";
     } else if (name === "set_composer_text") {
-      bindings.composer.setText(String(args.text ?? ""));
-      output = "Composer text replaced.";
+      if (!bindings.composer) {
+        output = "No composer is focused right now — open or start a thread to draft a message.";
+      } else {
+        bindings.composer.setText(String(args.text ?? ""));
+        output = "Composer text replaced.";
+      }
     } else if (name === "append_composer_text") {
-      const text = String(args.text ?? "");
-      bindings.composer.updateText((current) => (current ? `${current}\n${text}` : text));
-      output = "Text appended to composer.";
+      if (!bindings.composer) {
+        output = "No composer is focused right now — open or start a thread to draft a message.";
+      } else {
+        const text = String(args.text ?? "");
+        bindings.composer.updateText((current) => (current ? `${current}\n${text}` : text));
+        output = "Text appended to composer.";
+      }
     } else if (
       name === "start_thread" &&
       !(typeof args.prompt === "string" && args.prompt.trim())
@@ -448,11 +954,30 @@ export class VoiceAgent {
       bindings.openNewThread(projectId);
       output =
         "Opened the New thread screen with the project preselected. The user will type the prompt themselves; no thread exists yet.";
+    } else if (
+      MOBILE_NAV_TOOLS.has(name) &&
+      clientDescriptor.mobile &&
+      (this.state === "live" || this.state === "muted")
+    ) {
+      // On mobile, this tool backgrounds the realm that owns the call and iOS
+      // suspends the mic — the call dies. So don't run it during a live mobile
+      // call; have the model point the user to the tap target instead.
+      this.logDiag("nav.blocked", { name });
+      output =
+        "On mobile you can't navigate the app during a live call — it would background the call and cut the mic. Do NOT navigate. Instead, tell the user in one short sentence exactly what to tap to get there themselves.";
     } else {
+      // These tools navigate (…→ threads.open) which would background a live
+      // mobile call — tell the server not to focus so the work still happens but
+      // nothing navigates. (The promptless start_thread is handled above.)
+      const suppressFocus =
+        FOCUS_SUPPRESSIBLE_TOOLS.has(name) &&
+        clientDescriptor.mobile &&
+        (this.state === "live" || this.state === "muted");
+      if (suppressFocus) this.logDiag("nav.suppressedFocus", { name });
       try {
         const result = await bindings.rpc.call("runTool", {
           name,
-          args,
+          args: suppressFocus ? { ...args, focus: false } : args,
           ...bindings.context,
         });
         output = result.output;
@@ -475,10 +1000,12 @@ export class VoiceAgent {
   private async start() {
     const bindings = this.bindings;
     if (!bindings) return;
-    this.setState("connecting");
+    // Assign the nonce before entering "connecting" so that state's presence
+    // broadcast already carries our identity.
     const nonce = crypto.randomUUID();
     this.nonce = nonce;
-    this.log("session.started", { ...bindings.context });
+    this.setState("connecting");
+    this.log("session.started", { ...bindings.context, device: deviceSummary() });
     try {
       // Deterministic acquisition: enumerate what is actually present, resolve
       // the saved ids against it (a saved id whose salt rotated across restarts
@@ -529,7 +1056,11 @@ export class VoiceAgent {
       const pc = new RTCPeerConnection();
       const audio = new Audio();
       audio.autoplay = true;
-      const session: SessionHandle = { pc, stream, audio, dc: null };
+      // iOS plays inline (not fullscreen) and is far more reliable across
+      // navigation/backgrounding when the element is actually in the DOM — a
+      // detached `new Audio()` can go silent. Hidden so it never shows.
+      this.prepareAudioElement(audio);
+      const session: SessionHandle = { pc, stream, audio, dc: null, micTrack: null, micSender: null };
       this.session = session;
       // Never stay "connecting" forever: if the data channel hasn't opened in
       // time, tear the attempt down and let the user retry cleanly.
@@ -544,6 +1075,13 @@ export class VoiceAgent {
       if (this.session?.pc !== pc) return;
 
       for (const track of stream.getTracks()) pc.addTrack(track, stream);
+      // Track the mic sender + track so a suspended mic (iOS backgrounding) can
+      // be swapped for a fresh one via replaceTrack, no renegotiation needed.
+      session.micTrack = stream.getAudioTracks()[0] ?? null;
+      session.micSender =
+        pc.getSenders?.().find((sender) => sender.track?.kind === "audio") ?? null;
+      if (session.micTrack) this.attachMicLifecycle(session, session.micTrack);
+      this.attachPageLifecycle(session);
       pc.ontrack = (event) => {
         if (this.session?.pc !== pc) return; // torn down mid-negotiation
         audio.srcObject = event.streams[0] ?? new MediaStream([event.track]);
@@ -583,6 +1121,7 @@ export class VoiceAgent {
           this.clearConnectWatchdog();
           this.liveStartedAt = Date.now();
           this.setState("live");
+          this.startPresenceHeartbeat();
           this.log("session.live");
           this.logDiag("conn.dc.open");
         }
@@ -636,7 +1175,10 @@ export class VoiceAgent {
           }
           const response = event.response as Record<string, unknown> | undefined;
           const usage = response?.usage;
-          if (usage && typeof usage === "object") {
+          // A response.done can land after stop() cleared the nonce; without one
+          // the cost can't be attributed to a session, so drop it rather than
+          // writing an orphan usage row.
+          if (usage && typeof usage === "object" && this.nonce) {
             void this.bindings?.rpc
               .call("recordUsage", {
                 model: typeof response?.model === "string" ? response.model : null,

@@ -1,13 +1,28 @@
 // Aide sessions page: inspect voice sessions inside bb — the bb-native
 // version of CodeAide's HTML session log. Lists sessions with cost, and shows
 // a live-updating transcript: what you said, what Aide said, every tool call
-// with arguments and result, and errors.
-import { useCallback, useEffect, useState, useSyncExternalStore } from "react";
-import { useRealtime, useRpc } from "@get-bb/plugin-sdk/app";
+// with arguments and result, and errors. A bottom-center call console (the FAB)
+// starts/controls the call right here, so you never route through the composer
+// (which collapses on mobile) or switch sidebars to talk.
+import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
+import {
+  experimental_useSidebarThreadActions,
+  useBbContext,
+  useRealtime,
+  useRpc,
+} from "@get-bb/plugin-sdk/app";
 import type { rpcContract } from "./server";
 import { voiceAgent } from "./voice-agent";
+import { MicIcon, StopIcon, WaveformIcon, useCallElapsed } from "./voice-chrome";
 import { cn } from "@/lib/utils";
 
+interface DeviceInfo {
+  label: string;
+  mobile: boolean;
+  platform: string;
+  browser: string;
+  runtime: string;
+}
 interface SessionRow {
   id: string;
   startedAt: number;
@@ -15,12 +30,53 @@ interface SessionRow {
   events: number;
   ended: boolean;
   costUsd: number;
+  preview: string;
+  hasError: boolean;
+  device: DeviceInfo | null;
+}
+
+/** A phone glyph for mobile clients, a monitor for everything else. */
+function DeviceIcon({ mobile, className }: { mobile: boolean; className?: string }) {
+  return mobile ? (
+    <svg viewBox="0 0 16 16" className={className} fill="none" stroke="currentColor" strokeWidth="1.3" aria-hidden>
+      <rect x="4.5" y="1.5" width="7" height="13" rx="1.6" />
+      <path d="M7 12.5h2" strokeLinecap="round" />
+    </svg>
+  ) : (
+    <svg viewBox="0 0 16 16" className={className} fill="none" stroke="currentColor" strokeWidth="1.3" aria-hidden>
+      <rect x="1.5" y="2.5" width="13" height="8.5" rx="1.4" />
+      <path d="M6 14h4M8 11v3" strokeLinecap="round" />
+    </svg>
+  );
+}
+
+/** A friendly one-word runtime for the session header. */
+function runtimeLabel(runtime: string): string {
+  return runtime === "electron"
+    ? "desktop app"
+    : runtime === "native-webview"
+      ? "native app"
+      : runtime === "pwa"
+        ? "installed"
+        : runtime === "browser"
+          ? "browser"
+          : runtime;
+}
+
+/** "iOS · Safari · native app" — omits blanks. */
+function deviceDetail(d: DeviceInfo): string {
+  return [d.platform, d.browser, runtimeLabel(d.runtime)].filter(Boolean).join(" · ");
 }
 interface EventRow {
   id: number;
   ts: number;
   kind: string;
   payload: string;
+}
+interface PluginMeta {
+  id: string;
+  name: string;
+  iconUrl: string | null;
 }
 
 function fmtTime(ts: number): string {
@@ -70,115 +126,476 @@ function GearIcon() {
   );
 }
 
-/** Live session controls: state, mute/unmute, stop — right on the page. */
-function SessionControls() {
+/**
+ * The call console — a bottom-center control that owns the entire call
+ * lifecycle right on the Handsfree page. Idle: a "Talk to Aide" pill. Live: it
+ * expands into a console (mute · who-has-the-floor + duration · jump to the live
+ * transcript · stop). Same neutral-chrome + activity-color language as the
+ * composer pill; color marks who's speaking, everything else stays neutral.
+ *
+ * Rendered as a real element in a footer bar (not `position: fixed`) so it
+ * reserves its own space — nothing overlaps — and stays inside the plugin's own
+ * pointer/stacking context, which is what makes it reliably tappable on mobile.
+ */
+function CallConsole({ onViewTranscript, selectedId }: { onViewTranscript: (sessionId: string) => void; selectedId: string | null }) {
   const state = useSyncExternalStore(voiceAgent.subscribe, voiceAgent.getState);
-  if (state === "idle") {
-    return <span className="text-xs text-muted-foreground">No active session</span>;
-  }
+  const activity = useSyncExternalStore(voiceAgent.subscribe, voiceAgent.getActivity);
+  const micSuspended = useSyncExternalStore(voiceAgent.subscribe, voiceAgent.getMicSuspended);
+  const lastActivity = useSyncExternalStore(voiceAgent.subscribe, voiceAgent.getLastActivity);
+  const elapsed = useCallElapsed();
+  const live = state === "live";
   const muted = state === "muted";
-  return (
-    <span className="flex items-center gap-2">
-      <span className={cn("flex items-center gap-1.5 text-xs", muted ? "text-destructive" : "text-primary")}>
-        <span className={cn("size-2 rounded-full", muted ? "bg-destructive/70" : "animate-pulse bg-primary")} />
-        {state}
-      </span>
-      {state !== "connecting" ? (
-        <button
-          type="button"
-          onClick={() => voiceAgent.toggleMute()}
-          className={cn(
-            "rounded-md border px-2 py-0.5 text-xs",
-            muted
-              ? "border-destructive text-destructive"
-              : "border-border text-muted-foreground hover:text-foreground",
-          )}
-        >
-          {muted ? "Unmute" : "Mute"}
-        </button>
-      ) : null}
+  const active = live || muted;
+  const connecting = state === "connecting";
+
+  if (!active) {
+    return (
       <button
         type="button"
-        onClick={() => voiceAgent.stop()}
-        className="rounded-md border border-border px-2 py-0.5 text-xs text-muted-foreground hover:text-foreground"
+        aria-label="Start Aide voice agent"
+        title="Talk to Aide"
+        onClick={() => voiceAgent.toggleFromSurface()}
+        className={cn(
+          "flex h-11 items-center gap-2 rounded-full border border-border bg-card px-5 text-sm font-medium text-foreground shadow-lg transition-colors hover:bg-accent",
+          connecting && "animate-pulse",
+        )}
       >
-        Stop
+        <WaveformIcon live={false} />
+        {connecting ? "Connecting…" : "Talk to Aide"}
       </button>
-    </span>
+    );
+  }
+
+  const speaking = activity === "aide";
+  const listening = activity === "you";
+  const activityColor = micSuspended
+    ? "text-destructive" // uplink down (iOS backgrounded the mic)
+    : speaking
+      ? "text-[color:var(--success,#6faf76)]" // Aide
+      : listening
+        ? "text-foreground" // you
+        : "text-muted-foreground/70";
+  const label = micSuspended
+    ? "Mic paused"
+    : speaking
+      ? "Aide speaking…"
+      : listening
+        ? "Listening…"
+        : muted
+          ? "Muted"
+          : "Connected";
+  const liveId = voiceAgent.getSessionId();
+  const ticker = tickerFor(lastActivity);
+  // When you're already reading the live transcript, the ticker (and the pill's
+  // transcript button) are redundant with what's on screen — hide them.
+  const viewingLive = liveId != null && selectedId === liveId;
+
+  return (
+    <div className="flex w-full flex-col items-center gap-1.5">
+      {liveId && !viewingLive ? (
+        <button
+          type="button"
+          onClick={() => onViewTranscript(liveId)}
+          className="flex max-w-full items-center gap-1.5 rounded-full bg-card/70 px-3 py-1 text-xs text-muted-foreground shadow-sm backdrop-blur transition-colors hover:text-foreground"
+          title="See full transcript"
+        >
+          {ticker?.family ? (
+            <span className="flex size-4 shrink-0 items-center justify-center text-muted-foreground/80">
+              <ActionGlyph family={ticker.family} />
+            </span>
+          ) : null}
+          <span className="truncate">{ticker?.text ?? "See full transcript"}</span>
+          <svg viewBox="0 0 16 16" className="size-3 shrink-0 text-muted-foreground/50" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+            <path d="M6 4l4 4-4 4" />
+          </svg>
+        </button>
+      ) : null}
+      <div className="flex h-11 max-w-full items-center overflow-hidden rounded-full border border-border bg-card shadow-lg">
+      <button
+          type="button"
+          aria-label={muted ? "Unmute Aide microphone" : "Mute Aide microphone"}
+          title={muted ? "Unmute" : "Mute"}
+          onClick={() => voiceAgent.toggleMuteFromSurface()}
+          className={cn(
+            "flex size-11 shrink-0 items-center justify-center transition-colors",
+            muted
+              ? "text-destructive hover:bg-destructive/15"
+              : "text-muted-foreground hover:bg-accent hover:text-foreground",
+          )}
+        >
+          <MicIcon slashed={muted} />
+        </button>
+        <span className="h-5 w-px bg-border" />
+        <span className="flex min-w-0 items-center gap-2 px-3">
+          <span className={cn("flex shrink-0 items-center", activityColor)} title={label} aria-label={label}>
+            <WaveformIcon live={speaking || listening} />
+          </span>
+          <span className="truncate text-sm text-foreground">{label}</span>
+          <span className="shrink-0 tabular-nums text-xs text-muted-foreground">{elapsed ?? ""}</span>
+        </span>
+        <span className="h-5 w-px bg-border" />
+        <button
+          type="button"
+          aria-label="Stop Aide voice session"
+          title="Stop"
+          onClick={() => voiceAgent.stopFromSurface()}
+          className="flex size-11 shrink-0 items-center justify-center text-muted-foreground transition-colors hover:bg-destructive/15 hover:text-destructive"
+        >
+          <StopIcon />
+        </button>
+      </div>
+    </div>
   );
 }
 
-function EventLine({ event }: { event: EventRow }) {
-  const payload = parsePayload(event.payload);
-  const time = <span className="shrink-0 tabular-nums text-xs text-muted-foreground">{fmtTime(event.ts)}</span>;
-  switch (event.kind) {
-    case "user":
-      return (
-        <div className="flex gap-3 py-1.5">
-          {time}
-          <div className="text-sm">
-            <span className="font-medium text-foreground">You</span>{" "}
-            <span className="text-foreground/90">{String(payload.text ?? "")}</span>
-          </div>
-        </div>
-      );
-    case "assistant":
-      return (
-        <div className="flex gap-3 py-1.5">
-          {time}
-          <div className="text-sm">
-            <span className="font-medium text-primary">Aide</span>{" "}
-            <span className="text-foreground/90">{String(payload.text ?? "")}</span>
-          </div>
-        </div>
-      );
-    case "tool.call":
-      return (
-        <div className="flex gap-3 py-1">
-          {time}
-          <code className="rounded bg-muted px-1.5 py-0.5 text-xs text-muted-foreground">
-            → {String(payload.name ?? "?")}({JSON.stringify(payload.args ?? {})})
-          </code>
-        </div>
-      );
-    case "tool.result": {
-      const output = String(payload.output ?? "");
-      return (
-        <div className="flex gap-3 py-1">
-          {time}
-          <details className="min-w-0 flex-1">
-            <summary className="cursor-pointer truncate font-mono text-xs text-muted-foreground">
-              ← {String(payload.name ?? "?")}: {output.slice(0, 120)}
-            </summary>
-            <pre className="mt-1 overflow-x-auto whitespace-pre-wrap rounded bg-muted p-2 text-xs text-foreground/80">
-              {output}
-            </pre>
-          </details>
-        </div>
-      );
-    }
-    case "notice":
-      return (
-        <div className="flex gap-3 py-1.5">
-          {time}
-          <span className="text-sm italic text-muted-foreground">🔔 {String(payload.text ?? "")}</span>
-        </div>
-      );
-    case "error":
-      return (
-        <div className="flex gap-3 py-1.5">
-          {time}
-          <span className="text-sm text-destructive">{String(payload.message ?? "error")}</span>
-        </div>
-      );
-    default:
-      return (
-        <div className="flex gap-3 py-1">
-          {time}
-          <span className="text-xs italic text-muted-foreground">{event.kind.replace("session.", "session ")}</span>
-        </div>
-      );
+// ─── Transcript rendering ────────────────────────────────────────────────────
+// The transcript reads as a narrative, not a raw log: speech is attributed with
+// a speaker gutter + tint, and tool calls become human "action chips" (a paired
+// call+result resolved into one line) with the raw {args, output} always one
+// tap away. The action set is open-ended (built-ins + a dynamic
+// run_plugin_command), so known tools get crafted phrasing and everything else
+// falls through a generic humanizer — nothing is ever dropped or shown as junk.
+
+type ActionFamily = "inspect" | "navigate" | "mutate" | "compose" | "self" | "plugin" | "other";
+
+const ACTIONS: Record<string, { family: ActionFamily; verb: string }> = {
+  get_context: { family: "inspect", verb: "Read your context" },
+  list_projects: { family: "inspect", verb: "Listed projects" },
+  list_machines: { family: "inspect", verb: "Listed machines" },
+  list_live_threads: { family: "inspect", verb: "Listed live threads" },
+  list_threads: { family: "inspect", verb: "Listed threads" },
+  search_threads: { family: "inspect", verb: "Searched threads" },
+  read_thread: { family: "inspect", verb: "Read a thread" },
+  focus_thread: { family: "navigate", verb: "Focused a thread" },
+  set_pane: { family: "navigate", verb: "Changed the layout" },
+  show_diff: { family: "navigate", verb: "Opened a diff" },
+  send_to_thread: { family: "mutate", verb: "Sent a message" },
+  start_thread: { family: "mutate", verb: "Started a thread" },
+  stop_thread: { family: "mutate", verb: "Stopped a thread" },
+  archive_thread: { family: "mutate", verb: "Archived a thread" },
+  rename_thread: { family: "mutate", verb: "Renamed a thread" },
+  update_instructions: { family: "self", verb: "Updated its instructions" },
+  set_composer_text: { family: "compose", verb: "Drafted a message" },
+  append_composer_text: { family: "compose", verb: "Appended to the draft" },
+  run_plugin_command: { family: "plugin", verb: "Ran a plugin command" },
+};
+
+function actionMeta(name: string): { family: ActionFamily; verb: string } {
+  return ACTIONS[name] ?? { family: "other", verb: name.replace(/[._]/g, " ").replace(/^\w/, (c) => c.toUpperCase()) };
+}
+
+/**
+ * Human label for the dock's activity ticker from the agent's last event: a
+ * tool call shows its verb (with the family glyph); speech/notice show a short
+ * quote (no glyph). Returns null when there's nothing worth showing yet.
+ */
+function tickerFor(last: { kind: string; name: string; text: string } | null): { family: ActionFamily | null; text: string } | null {
+  if (!last) return null;
+  if (last.kind === "tool.call") {
+    const meta = actionMeta(last.name);
+    return { family: meta.family, text: meta.verb };
   }
+  const text = last.text.trim();
+  if (!text) return null;
+  const clipped = text.length > 80 ? `${text.slice(0, 80)}…` : text;
+  return { family: null, text: last.kind === "assistant" ? `“${clipped}”` : clipped };
+}
+
+/** The most salient argument to show inline next to the verb, if any. */
+function actionObject(name: string, args: Record<string, unknown>): string {
+  const str = (value: unknown): string => (typeof value === "string" ? value : "");
+  const clip = (text: string, max = 64): string => (text.length > max ? `${text.slice(0, max)}…` : text);
+  if (name === "run_plugin_command") {
+    const argv = Array.isArray(args.argv) ? (args.argv as unknown[]).map(String).join(" ") : "";
+    return clip([str(args.plugin_id), argv].filter(Boolean).join(" "));
+  }
+  return clip(str(args.query) || str(args.title) || str(args.message) || str(args.text) || str(args.prompt) || str(args.action));
+}
+
+function ActionGlyph({ family }: { family: ActionFamily }) {
+  const cls = "size-3";
+  switch (family) {
+    case "inspect":
+      return <svg viewBox="0 0 16 16" className={cls} fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" aria-hidden><circle cx="7" cy="7" r="4" /><path d="M13 13l-3-3" /></svg>;
+    case "navigate":
+      return <svg viewBox="0 0 16 16" className={cls} fill="none" stroke="currentColor" strokeWidth="1.5" aria-hidden><circle cx="8" cy="8" r="5.5" /><circle cx="8" cy="8" r="1.4" fill="currentColor" stroke="none" /></svg>;
+    case "mutate":
+      return <svg viewBox="0 0 16 16" className={cls} fill="currentColor" aria-hidden><path d="M8.7 1L3 9h4l-1.3 6L13 6.5H8.6z" /></svg>;
+    case "compose":
+      return <svg viewBox="0 0 16 16" className={cls} fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round" aria-hidden><path d="M11 2.4l2.6 2.6L6 12.6l-3.2.6.6-3.2z" /></svg>;
+    case "self":
+      return <svg viewBox="0 0 16 16" className={cls} fill="none" stroke="currentColor" strokeWidth="1.3" aria-hidden><circle cx="8" cy="8" r="2.1" /><circle cx="8" cy="8" r="5.5" /></svg>;
+    case "plugin":
+      return <svg viewBox="0 0 16 16" className={cls} fill="none" stroke="currentColor" strokeWidth="1.3" strokeLinejoin="round" aria-hidden><path d="M6.2 2.5h3.6v1.6a1.4 1.4 0 002.8 0V4h1.4v3.4h-1.6a1.4 1.4 0 000 2.8h1.6V13H2.4V9.9H4a1.4 1.4 0 000-2.8H2.4V2.5z" /></svg>;
+    default:
+      return <svg viewBox="0 0 16 16" className={cls} fill="currentColor" aria-hidden><circle cx="8" cy="8" r="2.4" /></svg>;
+  }
+}
+
+function Chevron() {
+  return (
+    <svg viewBox="0 0 16 16" className="ml-auto size-3 shrink-0 text-muted-foreground/40 transition-transform group-open:rotate-90" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+      <path d="M6 4l4 4-4 4" />
+    </svg>
+  );
+}
+
+type Row =
+  | { kind: "speech"; id: number; ts: number; who: "you" | "aide"; text: string }
+  | { kind: "action"; id: number; ts: number; name: string; args: Record<string, unknown>; output: string | null }
+  | { kind: "notice"; id: number; ts: number; text: string }
+  | { kind: "error"; id: number; ts: number; message: string }
+  | { kind: "sysgroup"; id: number; ts: number; events: EventRow[] };
+
+const CONVERSATION_KINDS = new Set(["user", "assistant", "tool.call", "tool.result", "notice", "error"]);
+
+/**
+ * Fold the raw event log into display rows: pair each tool.call with its result,
+ * and coalesce runs of low-level diagnostics (session.*, conn.*, audio.*) into a
+ * single collapsible "session connected"-style group so they don't bury the
+ * conversation. The full detail stays one tap away inside the group.
+ */
+function buildRows(events: EventRow[]): Row[] {
+  const rows: Row[] = [];
+  const consumed = new Set<number>();
+  let diagnostics: EventRow[] = [];
+  const flush = () => {
+    if (diagnostics.length === 0) return;
+    rows.push({ kind: "sysgroup", id: diagnostics[0].id, ts: diagnostics[0].ts, events: diagnostics });
+    diagnostics = [];
+  };
+  events.forEach((event, index) => {
+    if (!CONVERSATION_KINDS.has(event.kind)) {
+      diagnostics.push(event);
+      return;
+    }
+    flush();
+    const payload = parsePayload(event.payload);
+    switch (event.kind) {
+      case "user":
+      case "assistant":
+        rows.push({ kind: "speech", id: event.id, ts: event.ts, who: event.kind === "user" ? "you" : "aide", text: String(payload.text ?? "") });
+        break;
+      case "tool.call": {
+        const name = String(payload.name ?? "?");
+        let output: string | null = null;
+        for (let j = index + 1; j < events.length; j++) {
+          const later = events[j];
+          if (later.kind !== "tool.result" || consumed.has(later.id)) continue;
+          const lp = parsePayload(later.payload);
+          if (String(lp.name ?? "?") === name) {
+            output = String(lp.output ?? "");
+            consumed.add(later.id);
+            break;
+          }
+        }
+        rows.push({ kind: "action", id: event.id, ts: event.ts, name, args: (payload.args as Record<string, unknown>) ?? {}, output });
+        break;
+      }
+      case "tool.result":
+        if (consumed.has(event.id)) break; // already merged into its call
+        rows.push({ kind: "action", id: event.id, ts: event.ts, name: String(payload.name ?? "?"), args: {}, output: String(payload.output ?? "") });
+        break;
+      case "notice":
+        rows.push({ kind: "notice", id: event.id, ts: event.ts, text: String(payload.text ?? "") });
+        break;
+      case "error":
+        rows.push({ kind: "error", id: event.id, ts: event.ts, message: String(payload.message ?? "error") });
+        break;
+    }
+  });
+  flush();
+  return rows;
+}
+
+/** Human label for a diagnostics group, from the lifecycle events it contains. */
+function sysGroupLabel(events: EventRow[]): string {
+  const kinds = new Set(events.map((event) => event.kind));
+  if (kinds.has("session.stopped")) return "Session ended";
+  if (kinds.has("session.live")) return "Session connected";
+  if (kinds.has("session.started")) return "Session connecting";
+  return "Session activity";
+}
+
+function SpeechRow({ row }: { row: Extract<Row, { kind: "speech" }> }) {
+  const you = row.who === "you";
+  return (
+    <div className={cn("flex gap-2.5 rounded-md border-l-2 py-1.5 pl-2.5 pr-2", you ? "border-l-border bg-muted/40" : "border-l-primary/50 bg-primary/[0.06]")}>
+      <span className={cn("mt-0.5 flex size-5 shrink-0 items-center justify-center rounded-full", you ? "bg-muted text-muted-foreground" : "bg-primary/15 text-primary")}>
+        <span className="scale-75">{you ? <MicIcon slashed={false} /> : <WaveformIcon live={false} />}</span>
+      </span>
+      <div className="min-w-0 flex-1">
+        <span className="flex items-baseline gap-2">
+          <span className={cn("text-xs font-semibold", you ? "text-foreground" : "text-primary")}>{you ? "You" : "Aide"}</span>
+          <span className="text-[10px] tabular-nums text-muted-foreground/50">{fmtTime(row.ts)}</span>
+        </span>
+        <p className="whitespace-pre-wrap text-sm text-foreground/90">{row.text}</p>
+      </div>
+    </div>
+  );
+}
+
+function ActionRow({ row, plugins }: { row: Extract<Row, { kind: "action" }>; plugins: Map<string, PluginMeta> }) {
+  const meta = actionMeta(row.name);
+  const pending = row.output === null;
+  const isError = !pending && /^tool error/i.test(row.output ?? "");
+  const hasArgs = Object.keys(row.args).length > 0;
+
+  // run_plugin_command reads as "Used plugin [chip]": the left square keeps the
+  // generic plugin glyph (consistent with every action row), and the plugin's
+  // real name + icon (from listPlugins) ride in a chip next to it.
+  const isPlugin = row.name === "run_plugin_command";
+  let verb = meta.verb;
+  let object = actionObject(row.name, row.args);
+  let pluginName = "";
+  let pluginIcon: string | null = null;
+  if (isPlugin) {
+    const pluginId = typeof row.args.plugin_id === "string" ? row.args.plugin_id : "";
+    const plugin = plugins.get(pluginId);
+    verb = "Used plugin";
+    pluginName = plugin?.name ?? pluginId;
+    pluginIcon = plugin?.iconUrl ?? null;
+    object = Array.isArray(row.args.argv) ? (row.args.argv as unknown[]).map(String).join(" ") : "";
+  }
+
+  return (
+    <details className="group min-w-0 pl-2.5">
+      <summary className="flex min-w-0 cursor-pointer list-none items-center gap-2 py-1 text-xs">
+        <span className={cn("flex size-5 shrink-0 items-center justify-center rounded-md", isError ? "bg-destructive/15 text-destructive" : "bg-muted text-muted-foreground")}>
+          <ActionGlyph family={meta.family} />
+        </span>
+        <span className={cn("shrink-0 font-medium", isError ? "text-destructive" : "text-foreground/80")}>{verb}</span>
+        {isPlugin && pluginName ? (
+          <span className="inline-flex shrink-0 items-center gap-1 rounded-full bg-muted px-1.5 py-px text-[11px] font-medium text-foreground/80">
+            {pluginIcon ? <img src={pluginIcon} alt="" className="size-3 rounded-[3px] object-contain" /> : null}
+            {pluginName}
+          </span>
+        ) : null}
+        {object ? <span className="min-w-0 truncate text-muted-foreground">· {object}</span> : null}
+        {pending ? <span className="size-1.5 shrink-0 animate-pulse rounded-full bg-primary" /> : null}
+        <Chevron />
+      </summary>
+      <div className="mb-1 mt-1 space-y-1 pl-7">
+        {hasArgs ? (
+          <pre className="overflow-x-auto whitespace-pre-wrap break-words rounded bg-muted p-2 font-mono text-[11px] text-muted-foreground">{JSON.stringify(row.args, null, 2)}</pre>
+        ) : null}
+        {row.output ? (
+          <pre className="overflow-x-auto whitespace-pre-wrap break-words rounded bg-muted p-2 font-mono text-[11px] text-foreground/80">{row.output}</pre>
+        ) : (
+          <p className="text-[11px] italic text-muted-foreground">Waiting for result…</p>
+        )}
+      </div>
+    </details>
+  );
+}
+
+function NoticeRow({ row }: { row: Extract<Row, { kind: "notice" }> }) {
+  return (
+    <p className="px-2 py-1 text-center text-xs italic text-muted-foreground/80">🔔 {row.text}</p>
+  );
+}
+
+function ErrorRow({ row }: { row: Extract<Row, { kind: "error" }> }) {
+  return (
+    <div className="flex items-start gap-2 rounded-md border border-destructive/30 bg-destructive/10 px-2.5 py-1.5">
+      <span className="mt-px text-xs text-destructive">⚠</span>
+      <span className="text-sm text-destructive">{row.message}</span>
+    </div>
+  );
+}
+
+function SysGroupRow({ row }: { row: Extract<Row, { kind: "sysgroup" }> }) {
+  const label = sysGroupLabel(row.events);
+  return (
+    <details className="group min-w-0">
+      <summary className="mx-auto flex w-fit cursor-pointer list-none items-center justify-center gap-1.5 py-0.5 text-[11px] text-muted-foreground/60 hover:text-muted-foreground">
+        <span className="size-1.5 rounded-full bg-muted-foreground/40" />
+        {label}
+        <span className="text-muted-foreground/40">· {row.events.length}</span>
+        <Chevron />
+      </summary>
+      <div className="mt-1 space-y-1 rounded-md bg-muted/40 p-2">
+        {row.events.map((event) => {
+          const payload = event.payload && event.payload !== "{}" ? event.payload : "";
+          return (
+            <div key={event.id} className="min-w-0 font-mono text-[10px] leading-relaxed text-muted-foreground">
+              <span className="mr-2 tabular-nums text-muted-foreground/50">{fmtTime(event.ts)}</span>
+              <span className="text-foreground/70">{event.kind}</span>
+              {payload ? <span className="break-all"> {payload}</span> : null}
+            </div>
+          );
+        })}
+      </div>
+    </details>
+  );
+}
+
+type TranscriptFilter = "all" | "talk" | "actions" | "errors";
+
+const FILTERS: { id: TranscriptFilter; label: string }[] = [
+  { id: "all", label: "All" },
+  { id: "talk", label: "Conversation" },
+  { id: "actions", label: "Actions" },
+  { id: "errors", label: "Errors" },
+];
+
+function rowMatchesFilter(row: Row, filter: TranscriptFilter): boolean {
+  const actionErrored = row.kind === "action" && row.output !== null && /^tool error/i.test(row.output);
+  switch (filter) {
+    case "talk":
+      return row.kind === "speech" || row.kind === "notice";
+    case "actions":
+      return row.kind === "action";
+    case "errors":
+      return row.kind === "error" || actionErrored;
+    default:
+      return true;
+  }
+}
+
+function FilterBar({ value, onChange }: { value: TranscriptFilter; onChange: (next: TranscriptFilter) => void }) {
+  return (
+    <div className="flex items-center gap-1 rounded-md border border-border bg-card p-0.5">
+      {FILTERS.map((filter) => (
+        <button
+          key={filter.id}
+          type="button"
+          onClick={() => onChange(filter.id)}
+          className={cn(
+            "rounded px-2 py-0.5 text-xs transition-colors",
+            value === filter.id ? "bg-accent font-medium text-foreground" : "text-muted-foreground hover:text-foreground",
+          )}
+        >
+          {filter.label}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+function TranscriptBody({ events, plugins, filter }: { events: EventRow[]; plugins: Map<string, PluginMeta>; filter: TranscriptFilter }) {
+  const rows = buildRows(events).filter((row) => rowMatchesFilter(row, filter));
+  if (rows.length === 0) {
+    return <p className="py-3 text-center text-sm text-muted-foreground">Nothing matches this filter.</p>;
+  }
+  return (
+    <div className="space-y-1 py-1.5">
+      {rows.map((row) => {
+        switch (row.kind) {
+          case "speech":
+            return <SpeechRow key={row.id} row={row} />;
+          case "action":
+            return <ActionRow key={row.id} row={row} plugins={plugins} />;
+          case "notice":
+            return <NoticeRow key={row.id} row={row} />;
+          case "error":
+            return <ErrorRow key={row.id} row={row} />;
+          default:
+            return <SysGroupRow key={row.id} row={row} />;
+        }
+      })}
+    </div>
+  );
 }
 
 /**
@@ -211,21 +628,90 @@ function useEscapeToClose() {
 
 export function SessionsPanel() {
   const rpc = useRpc<typeof rpcContract>();
+  const { threadId, projectId } = useBbContext();
+  const sidebarActions = experimental_useSidebarThreadActions();
   useEscapeToClose();
+
+  // The Handsfree page has no composer, so nothing else binds the voice agent
+  // here. Install a fallback binding so the FAB can actually start a call from a
+  // cold page — but only when nothing richer is already bound (a live composer's
+  // binding, which its text tools target, must win). We deliberately bind no
+  // composer: with nothing to type into, the text tools report that honestly
+  // (see handleToolCall) rather than silently opening a thread behind the user's
+  // back. Everything else (thread focus, starting work, diffs) runs through rpc,
+  // which works from anywhere.
+  useEffect(() => {
+    voiceAgent.bindFallback({
+      rpc,
+      context: { threadId: threadId ?? null, projectId: projectId ?? null, onNewThreadScreen: false },
+      openNewThread: (targetProjectId) =>
+        sidebarActions.openNewThread({
+          ...(targetProjectId ? { projectId: targetProjectId } : {}),
+          focusPrompt: true,
+        }),
+    });
+  }, [rpc, threadId, projectId, sidebarActions]);
   const [sessions, setSessions] = useState<SessionRow[] | null>(null);
+  const [hasMore, setHasMore] = useState(false);
+  const [loadingMore, setLoadingMore] = useState(false);
   const [selected, setSelected] = useState<string | null>(null);
   const [events, setEvents] = useState<EventRow[]>([]);
+  const [filter, setFilter] = useState<TranscriptFilter>("all");
+  const [search, setSearch] = useState("");
+  const [errorsOnly, setErrorsOnly] = useState(false);
+  const [plugins, setPlugins] = useState<Map<string, PluginMeta>>(() => new Map());
   const [error, setError] = useState<string | null>(null);
+  // The call active in THIS window always reads live, overriding the server's
+  // stale heuristic (which can't see an active-but-quiet call).
+  const activeSessionId = useSyncExternalStore(voiceAgent.subscribe, voiceAgent.getSessionId);
+  const scrollRef = useRef<HTMLDivElement | null>(null);
+  // Set when the transcript is opened so the first batch of events snaps to the
+  // bottom (latest), even if the list is taller than the viewport.
+  const pendingBottom = useRef(false);
 
-  const refetchSessions = useCallback(() => {
-    rpc.call("listSessions", null).then(
+  // Refresh the newest page and fold it over what's loaded: update rows in place
+  // (counts/cost/ended change as a call runs) and prepend brand-new sessions,
+  // without dropping older pages the user already fetched via "Load more".
+  const mergeNewest = useCallback((rows: SessionRow[], more: boolean) => {
+    setSessions((prev) => {
+      if (!prev) {
+        setHasMore(more);
+        return rows;
+      }
+      const incoming = new Map(rows.map((row) => [row.id, row]));
+      const updated = prev.map((session) => incoming.get(session.id) ?? session);
+      const existing = new Set(prev.map((session) => session.id));
+      const fresh = rows.filter((row) => !existing.has(row.id));
+      return fresh.length ? [...fresh, ...updated] : updated;
+    });
+  }, []);
+
+  const refreshNewest = useCallback(() => {
+    rpc.call("listSessions", { offset: 0 }).then(
       (result) => {
-        setSessions(result.sessions);
+        mergeNewest(result.sessions, result.hasMore);
         setError(null);
       },
       (cause) => setError(cause instanceof Error ? cause.message : String(cause)),
     );
-  }, [rpc]);
+  }, [rpc, mergeNewest]);
+
+  const loadMore = useCallback(() => {
+    if (!sessions) return;
+    setLoadingMore(true);
+    rpc.call("listSessions", { offset: sessions.length }).then(
+      (result) => {
+        setSessions((prev) => {
+          if (!prev) return result.sessions;
+          const existing = new Set(prev.map((session) => session.id));
+          return [...prev, ...result.sessions.filter((row) => !existing.has(row.id))];
+        });
+        setHasMore(result.hasMore);
+        setLoadingMore(false);
+      },
+      () => setLoadingMore(false),
+    );
+  }, [rpc, sessions]);
 
   const refetchEvents = useCallback(
     (sessionId: string) => {
@@ -237,98 +723,223 @@ export function SessionsPanel() {
     [rpc],
   );
 
-  useEffect(refetchSessions, [refetchSessions]);
   useEffect(() => {
-    if (selected) refetchEvents(selected);
+    refreshNewest();
+  }, [refreshNewest]);
+  // Plugin metadata (id → name + icon) to narrate run_plugin_command; static
+  // enough to fetch once.
+  useEffect(() => {
+    rpc.call("listPlugins", null).then(
+      (result) => setPlugins(new Map(result.plugins.map((plugin) => [plugin.id, plugin]))),
+      () => undefined,
+    );
+  }, [rpc]);
+  useEffect(() => {
+    if (selected) {
+      pendingBottom.current = true;
+      refetchEvents(selected);
+    }
   }, [selected, refetchEvents]);
 
   // Live updates: the server publishes on every logged event.
   useRealtime("aide-log", (payload) => {
-    refetchSessions();
+    refreshNewest();
     const sessionId = (payload as { sessionId?: unknown } | null)?.sessionId;
     if (selected && sessionId === selected) refetchEvents(selected);
   });
 
+  // Cross-surface presence: mirror a call owned by another realm so the console
+  // reflects it, and relay stop/mute from the console back to the owning realm.
+  useRealtime("voice-presence", (payload) => voiceAgent.ingestPresence(payload));
+  useRealtime("voice-command", (payload) => voiceAgent.applyVoiceCommand(payload));
+  useRealtime("voice-presence-query", () => voiceAgent.answerPresenceQuery());
+
+  // Catch up the moment the page mounts (e.g. a realm rebuilt after navigating
+  // back) instead of waiting up to a heartbeat — this is the "shows Talk to Aide
+  // over a live call, then flips to Connected a few seconds later" gap.
+  useEffect(() => voiceAgent.requestPresence(), []);
+
+  // Auto-follow the transcript: after opening it, or when new events land while
+  // you're already reading the bottom, snap to the latest — but if you've
+  // scrolled up to read history, stay put.
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!selected || !el) return;
+    const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 160;
+    if (pendingBottom.current || nearBottom) {
+      el.scrollTop = el.scrollHeight;
+      pendingBottom.current = false;
+    }
+  }, [events, selected]);
+
   const current = sessions?.find((session) => session.id === selected) ?? null;
+  const isLive = (session: SessionRow): boolean => !session.ended || session.id === activeSessionId;
+  const query = search.trim().toLowerCase();
+  // Client-side filter over already-loaded sessions (Load more fetches the rest).
+  const visibleSessions = sessions?.filter(
+    (session) =>
+      (!errorsOnly || session.hasError) &&
+      (!query || session.preview.toLowerCase().includes(query) || fmtDate(session.startedAt).toLowerCase().includes(query)),
+  );
 
   return (
-    <div className="h-full overflow-y-auto p-4 md:p-5">
-      <div className="mx-auto w-full max-w-3xl space-y-4">
+    <div className="flex h-full flex-col">
+      <div ref={scrollRef} className="flex-1 overflow-y-auto overflow-x-hidden p-4 md:p-5">
+      <div className="mx-auto w-full min-w-0 max-w-3xl space-y-4">
         {error ? <p className="text-sm text-destructive">{error}</p> : null}
-        {current ? (
+        {selected ? (
           <>
-            <div className="flex items-center gap-3">
+            <div className="flex flex-wrap items-center justify-between gap-2">
               <button
                 type="button"
                 onClick={() => setSelected(null)}
-                className="rounded border border-border px-2 py-1 text-xs text-muted-foreground hover:bg-accent hover:text-foreground"
+                className="flex shrink-0 items-center gap-1 rounded-md border border-border px-2 py-1 text-xs text-muted-foreground hover:bg-accent hover:text-foreground"
               >
                 ← All sessions
               </button>
-              <span className="text-sm text-foreground">
-                {fmtDate(current.startedAt)} · {duration(current.startedAt, current.lastEventAt)} ·{" "}
-                {current.ended ? "ended" : "live"} ·{" "}
-                {current.costUsd > 0 ? `~$${current.costUsd.toFixed(4)}` : "no usage recorded"}
-              </span>
+              <FilterBar value={filter} onChange={setFilter} />
             </div>
-            <div className="divide-y divide-border/50 rounded-lg border border-border bg-card px-3 py-1">
+            <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2 rounded-lg border border-border bg-card px-3.5 py-2.5">
+              <div className="flex items-center gap-2.5">
+                {current && isLive(current) ? (
+                  <span className="size-2.5 shrink-0 animate-pulse rounded-full bg-primary" />
+                ) : null}
+                <div className="leading-tight">
+                  <div className="text-sm font-medium text-foreground">
+                    {current ? fmtDate(current.startedAt) : "Live session"}
+                  </div>
+                  <div className="text-xs text-muted-foreground">
+                    {current ? (isLive(current) ? "Live now" : "Ended") : "Connecting…"}
+                    {current ? ` · ${duration(current.startedAt, current.lastEventAt)}` : ""}
+                  </div>
+                  {current?.device ? (
+                    <div className="mt-0.5 flex items-center gap-1.5 text-xs text-muted-foreground/80">
+                      <DeviceIcon mobile={current.device.mobile} className="size-3.5 shrink-0" />
+                      <span className="truncate">{deviceDetail(current.device)}</span>
+                    </div>
+                  ) : null}
+                </div>
+              </div>
+              {current ? (
+                <div className="flex items-center gap-4 tabular-nums">
+                  <span className="flex flex-col items-end">
+                    <span className="text-sm font-medium text-foreground">{current.events}</span>
+                    <span className="text-[10px] uppercase tracking-wide text-muted-foreground/60">events</span>
+                  </span>
+                  <span className="flex flex-col items-end">
+                    <span className="text-sm font-medium text-foreground">
+                      {current.costUsd > 0 ? `~$${current.costUsd.toFixed(4)}` : "—"}
+                    </span>
+                    <span className="text-[10px] uppercase tracking-wide text-muted-foreground/60">cost</span>
+                  </span>
+                </div>
+              ) : null}
+            </div>
+            <div className="rounded-lg border border-border bg-card px-2 py-1">
               {events.length === 0 ? (
-                <p className="py-3 text-sm text-muted-foreground">No events.</p>
+                <p className="py-3 text-center text-sm text-muted-foreground">No events yet.</p>
               ) : (
-                events.map((event) => <EventLine key={event.id} event={event} />)
+                <TranscriptBody events={events} plugins={plugins} filter={filter} />
               )}
             </div>
           </>
         ) : (
           <>
             <div className="flex items-center justify-between gap-3">
-              <p className="text-sm text-muted-foreground">Aide Voice Session Transcripts</p>
-              <span className="flex items-center gap-4">
-                <SessionControls />
+              <p className="text-sm font-medium text-foreground">Voice sessions</p>
+              <button
+                type="button"
+                onClick={openHandsfreeSettings}
+                title="Open Handsfree settings"
+                aria-label="Open Handsfree settings"
+                className="flex items-center gap-1.5 rounded-md border border-border px-2 py-0.5 text-xs text-muted-foreground hover:bg-accent hover:text-foreground"
+              >
+                <GearIcon />
+                Settings
+              </button>
+            </div>
+            {sessions && sessions.length > 0 ? (
+              <div className="flex items-center gap-2">
+                <input
+                  type="search"
+                  value={search}
+                  onChange={(event) => setSearch(event.target.value)}
+                  placeholder="Search sessions…"
+                  className="min-w-0 flex-1 rounded-md border border-border bg-card px-2.5 py-1.5 text-sm text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-1 focus:ring-ring"
+                />
                 <button
                   type="button"
-                  onClick={openHandsfreeSettings}
-                  title="Open Handsfree settings"
-                  aria-label="Open Handsfree settings"
-                  className="flex items-center gap-1.5 rounded-md border border-border px-2 py-0.5 text-xs text-muted-foreground hover:bg-accent hover:text-foreground"
+                  onClick={() => setErrorsOnly((value) => !value)}
+                  className={cn(
+                    "shrink-0 rounded-md border px-2.5 py-1.5 text-xs transition-colors",
+                    errorsOnly
+                      ? "border-destructive/50 bg-destructive/10 text-destructive"
+                      : "border-border text-muted-foreground hover:text-foreground",
+                  )}
                 >
-                  <GearIcon />
-                  Settings
+                  Errors
                 </button>
-              </span>
-            </div>
+              </div>
+            ) : null}
             <div className="divide-y divide-border/50 rounded-lg border border-border bg-card">
               {sessions === null ? (
                 <p className="p-3 text-sm text-muted-foreground">Loading…</p>
               ) : sessions.length === 0 ? (
                 <p className="p-3 text-sm text-muted-foreground">
-                  No sessions yet. Click the waveform button in any composer and start talking.
+                  No sessions yet. Tap “Talk to Aide” below to start your first one.
                 </p>
+              ) : visibleSessions && visibleSessions.length === 0 ? (
+                <p className="p-3 text-sm text-muted-foreground">No sessions match.</p>
               ) : (
-                sessions.map((session) => (
+                visibleSessions?.map((session) => (
                   <button
                     key={session.id}
                     type="button"
                     onClick={() => setSelected(session.id)}
                     className="flex w-full items-center gap-3 px-3 py-2.5 text-left hover:bg-accent"
                   >
-                    <span
-                      className={cn(
-                        "size-2 shrink-0 rounded-full",
-                        session.ended ? "bg-border" : "animate-pulse bg-primary",
-                      )}
-                    />
-                    <span className="flex-1 text-sm text-foreground">{fmtDate(session.startedAt)}</span>
-                    <span className="text-xs tabular-nums text-muted-foreground">
-                      {duration(session.startedAt, session.lastEventAt)} · {session.events} events ·{" "}
-                      {session.costUsd > 0 ? `~$${session.costUsd.toFixed(4)}` : "no usage"}
+                    <span className="min-w-0 flex-1">
+                      <span className="block truncate text-sm text-foreground">
+                        {session.preview || <span className="italic text-muted-foreground">No transcript</span>}
+                      </span>
+                      <span className="mt-0.5 block text-xs tabular-nums text-muted-foreground">
+                        {fmtDate(session.startedAt)} · {duration(session.startedAt, session.lastEventAt)}
+                      </span>
                     </span>
+                    {session.device ? (
+                      <span title={session.device.label} className="flex shrink-0 items-center">
+                        <DeviceIcon mobile={session.device.mobile} className="size-4 text-muted-foreground/50" />
+                      </span>
+                    ) : null}
+                    {isLive(session) ? (
+                      <span className="size-2 shrink-0 animate-pulse rounded-full bg-primary" title="Live" />
+                    ) : session.hasError ? (
+                      <span className="shrink-0 text-xs text-destructive" title="This session had an error">⚠</span>
+                    ) : null}
                   </button>
                 ))
               )}
             </div>
+            {hasMore ? (
+              <div className="flex justify-center">
+                <button
+                  type="button"
+                  onClick={loadMore}
+                  disabled={loadingMore}
+                  className="rounded-md border border-border px-3 py-1.5 text-xs text-muted-foreground transition-colors hover:bg-accent hover:text-foreground disabled:opacity-60"
+                >
+                  {loadingMore ? "Loading…" : "Load more"}
+                </button>
+              </div>
+            ) : null}
           </>
         )}
+      </div>
+      </div>
+      <div className="shrink-0 border-t border-border/60 bg-background/90 px-4 py-3 backdrop-blur">
+        <div className="mx-auto flex w-full max-w-3xl justify-center">
+          <CallConsole onViewTranscript={(sessionId) => setSelected(sessionId)} selectedId={selected} />
+        </div>
       </div>
     </div>
   );

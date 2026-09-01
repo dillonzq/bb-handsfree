@@ -5,7 +5,7 @@
 // and audio playback happen right here in the bb app); the backend performs
 // the SDP exchange (it holds the API key) and executes bb tools via bb.sdk.
 // The session itself lives in voice-agent.ts and outlives any component.
-import { useEffect, useState, useSyncExternalStore } from "react";
+import { useEffect, useSyncExternalStore } from "react";
 import {
   definePluginApp,
   experimental_useSidebarThreadActions,
@@ -22,44 +22,8 @@ import { SessionsPanel } from "./sessions-panel";
 import { AudioSettings, BehaviorSettings, ModelsSettings } from "./settings-sections";
 import { cn } from "@/lib/utils";
 import { AUDIO_DEVICE_STORAGE_KEY } from "./audio-devices";
+import { MicIcon, StopIcon, WaveformIcon, useCallElapsed } from "./voice-chrome";
 import "./app.css";
-
-
-function WaveformIcon({ live }: { live: boolean }) {
-  return (
-    <svg
-      viewBox="0 0 16 16"
-      className={cn("size-4", live && "aide-wave-live")}
-      fill="currentColor"
-      aria-hidden
-    >
-      <rect className="aide-bar" x="1.5" y="6" width="1.8" height="4" rx="0.9" />
-      <rect className="aide-bar" x="4.9" y="3.5" width="1.8" height="9" rx="0.9" />
-      <rect className="aide-bar" x="8.3" y="1.5" width="1.8" height="13" rx="0.9" />
-      <rect className="aide-bar" x="11.7" y="4.5" width="1.8" height="7" rx="0.9" />
-    </svg>
-  );
-}
-
-function MicIcon({ slashed }: { slashed: boolean }) {
-  return (
-    <svg viewBox="0 0 16 16" className="size-4" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" aria-hidden>
-      <rect x="6" y="1.8" width="4" height="7" rx="2" fill="currentColor" stroke="none" />
-      <path d="M3.5 7.5a4.5 4.5 0 0 0 9 0" />
-      <path d="M8 12v2.2" />
-      {slashed ? <path d="M2.5 2.5l11 11" strokeWidth="1.6" /> : null}
-    </svg>
-  );
-}
-
-/** A rounded stop square — ends the voice session. */
-function StopIcon() {
-  return (
-    <svg viewBox="0 0 16 16" className="size-3.5" fill="currentColor" aria-hidden>
-      <rect x="4" y="4" width="8" height="8" rx="1.6" />
-    </svg>
-  );
-}
 
 function AideVoiceButton() {
   const rpc = useRpc<typeof rpcContract>();
@@ -76,6 +40,7 @@ function AideVoiceButton() {
   const sidebarActions = experimental_useSidebarThreadActions();
   const state = useSyncExternalStore(voiceAgent.subscribe, voiceAgent.getState);
   const activity = useSyncExternalStore(voiceAgent.subscribe, voiceAgent.getActivity);
+  const micSuspended = useSyncExternalStore(voiceAgent.subscribe, voiceAgent.getMicSuspended);
 
   // Global exclusivity: when any window starts a call, all others stop theirs.
   useRealtime("voice-call", (payload) => {
@@ -88,6 +53,16 @@ function AideVoiceButton() {
     const muted = (payload as { muted?: unknown } | null)?.muted;
     if (typeof muted === "boolean") voiceAgent.setMuted(muted);
   });
+
+  // Cross-surface presence: mirror a call owned by another realm so this pill
+  // reflects it, and relay stop/mute back to whichever realm owns the call.
+  useRealtime("voice-presence", (payload) => voiceAgent.ingestPresence(payload));
+  useRealtime("voice-command", (payload) => voiceAgent.applyVoiceCommand(payload));
+  useRealtime("voice-presence-query", () => voiceAgent.answerPresenceQuery());
+
+  // Catch up immediately when this surface mounts (e.g. a realm rebuilt after
+  // navigation), rather than waiting up to a heartbeat to learn a call is live.
+  useEffect(() => voiceAgent.requestPresence(), []);
 
   // Thread-event notifications (digested; disabled via `notifications` setting).
   useRealtime("aide-thread-event", (payload) => {
@@ -130,20 +105,24 @@ function AideVoiceButton() {
     // by the slashed mic on the left button, not by graying this out.
     const speaking = activity === "aide";
     const listening = activity === "you"; // never true while muted (mic is off)
-    const middleLabel = speaking
-      ? "Aide speaking…"
-      : listening
-        ? "Listening…"
-        : muted
-          ? "Muted"
-          : "Connected";
+    // A suspended mic (iOS backgrounding) means Aide can't hear you — say so
+    // rather than showing a reassuring "Connected".
+    const middleLabel = micSuspended
+      ? "Mic paused"
+      : speaking
+        ? "Aide speaking…"
+        : listening
+          ? "Listening…"
+          : muted
+            ? "Muted"
+            : "Connected";
     return (
       <div className="flex h-7 shrink-0 items-center overflow-hidden rounded-full border border-border bg-accent">
         <button
           type="button"
           aria-label={muted ? "Unmute Aide microphone" : "Mute Aide microphone"}
           title={muted ? "Unmute" : "Mute"}
-          onClick={() => voiceAgent.toggleMute()}
+          onClick={() => voiceAgent.toggleMuteFromSurface()}
           className={cn(
             "flex size-7 items-center justify-center transition-colors",
             muted
@@ -159,11 +138,13 @@ function AideVoiceButton() {
             "flex h-7 items-center justify-center px-2 transition-colors",
             // Aide can still be talking while you're muted, so who's-speaking
             // wins over the muted/quiet dim (mute is shown by the slashed mic).
-            speaking
-              ? "text-[color:var(--success,#6faf76)]" // themed green for Aide
-              : listening
-                ? "text-foreground"
-                : "text-muted-foreground/60",
+            micSuspended
+              ? "text-destructive" // uplink down — surface it, don't reassure
+              : speaking
+                ? "text-[color:var(--success,#6faf76)]" // themed green for Aide
+                : listening
+                  ? "text-foreground"
+                  : "text-muted-foreground/60",
           )}
           title={middleLabel}
           aria-label={middleLabel}
@@ -175,7 +156,7 @@ function AideVoiceButton() {
           type="button"
           aria-label="Stop Aide voice session"
           title="Stop"
-          onClick={() => voiceAgent.stop()}
+          onClick={() => voiceAgent.stopFromSurface()}
           className="flex size-7 items-center justify-center text-muted-foreground transition-colors hover:bg-destructive/15 hover:text-destructive"
         >
           <StopIcon />
@@ -189,7 +170,7 @@ function AideVoiceButton() {
       type="button"
       aria-label="Start Aide voice agent"
       title="Talk to Aide"
-      onClick={() => voiceAgent.toggle()}
+      onClick={() => voiceAgent.toggleFromSurface()}
       className={cn(
         "flex size-7 shrink-0 items-center justify-center rounded-full border transition-colors",
         state === "connecting"
@@ -241,7 +222,7 @@ function SidebarVoiceBar() {
         type="button"
         aria-label={active ? "Stop Aide voice agent" : "Start Aide voice agent"}
         title={active ? "Stop Aide" : "Talk to Aide"}
-        onClick={() => voiceAgent.toggle()}
+        onClick={() => voiceAgent.toggleFromSurface()}
         className={cn(
           "flex h-7 flex-1 items-center justify-center gap-1.5 rounded-md border border-border px-2 text-xs font-medium transition-colors",
           active
@@ -260,7 +241,7 @@ function SidebarVoiceBar() {
           type="button"
           aria-label={muted ? "Unmute Aide microphone" : "Mute Aide microphone"}
           title={muted ? "Unmute" : "Mute"}
-          onClick={() => voiceAgent.toggleMute()}
+          onClick={() => voiceAgent.toggleMuteFromSurface()}
           className={cn(
             "flex size-7 shrink-0 items-center justify-center rounded-md border border-border transition-colors",
             muted
@@ -291,26 +272,6 @@ function ThreadListWithVoiceBar({ Original }: PluginThreadListProps) {
       </div>
     </div>
   );
-}
-
-function formatElapsed(ms: number): string {
-  const total = Math.floor(Math.max(0, ms) / 1000);
-  const minutes = Math.floor(total / 60);
-  const seconds = total % 60;
-  return `${minutes}:${String(seconds).padStart(2, "0")}`;
-}
-
-/** Live call duration as m:ss, ticking each second; null when no live call. */
-function useCallElapsed(): string | null {
-  const startedAt = useSyncExternalStore(voiceAgent.subscribe, voiceAgent.getLiveStartedAt);
-  const [now, setNow] = useState(() => Date.now());
-  useEffect(() => {
-    if (startedAt == null) return;
-    setNow(Date.now());
-    const id = setInterval(() => setNow(Date.now()), 1000);
-    return () => clearInterval(id);
-  }, [startedAt]);
-  return startedAt == null ? null : formatElapsed(now - startedAt);
 }
 
 /** Trailing accessory on the Aide sidebar row: a live indicator with duration. */
