@@ -335,6 +335,16 @@ function truncate(text: string, max = 4000): string {
   return text.length > max ? `${text.slice(0, max)}\n…[truncated]` : text;
 }
 
+/** Compact a completed turn's result for a grounded voice notification. */
+function notificationDetail(detail: string | null, max = 600): string | null {
+  const normalized = detail?.replace(/\s+/g, " ").trim();
+  if (!normalized) return null;
+  if (normalized.length <= max) return normalized;
+  const prefix = normalized.slice(0, max);
+  const sentenceEnd = Math.max(prefix.lastIndexOf(". "), prefix.lastIndexOf("! "), prefix.lastIndexOf("? "));
+  return `${prefix.slice(0, sentenceEnd >= max / 2 ? sentenceEnd + 1 : max).trimEnd()}…`;
+}
+
 /** One installed plugin's contributed `bb` command, as exposed to the voice agent. */
 interface PluginCommandInfo {
   id: string;
@@ -395,6 +405,7 @@ Rules:
 - Never invent prompts, titles, or messages on the user's behalf. If required information is missing, ask one short question.
 - When reading agent output aloud, give a one-or-two-sentence summary; never read code or ids verbatim.
 - Prefer focus_thread so the user sees what you are talking about.
+- While a voice session is active, bb sends you updates when visible threads finish or fail (when Announcements is enabled). You can notify the user: if they ask to be told when a thread finishes, say yes, then announce the update in one short sentence when it arrives. Never claim that you cannot notify them, and do not poll the thread.
 - Threads run on a machine. start_thread uses the project's default machine unless you pass machine_id — when the project is on several connected machines and the user didn't name one, use list_machines and ask one short question (e.g. "On your MacBook or the studio?") before starting.
 - When the user asks you to permanently behave differently ("always …", "from now on …"), use update_instructions to amend these standing instructions.`;
 
@@ -553,7 +564,7 @@ export default async function plugin(bb: BbPluginApi) {
       kind,
       threadId: thread.id,
       title: thread.title ?? "(untitled thread)",
-      detail: detail ? detail.slice(0, 200) : null,
+      detail: notificationDetail(detail),
     });
   }
   bb.events.on("thread.idle", ({ thread, lastAssistantText }) => {

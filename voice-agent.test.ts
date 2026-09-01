@@ -1,6 +1,6 @@
 import test, { mock } from "node:test";
 import assert from "node:assert/strict";
-import { VoiceAgent } from "./voice-agent.ts";
+import { VoiceAgent, formatThreadNotices } from "./voice-agent.ts";
 import { writeAudioDevicePreferences } from "./audio-devices.ts";
 
 /** A VoiceAgent bound to a spy rpc that records every relayed call. */
@@ -140,6 +140,36 @@ test("reloads audio preferences saved by another browser window", () => {
     if (originalWindow) Object.defineProperty(globalThis, "window", originalWindow);
     else delete (globalThis as { window?: unknown }).window;
   }
+});
+
+test("grounds a thread notification in the latest completed result", () => {
+  const { logText, instruction } = formatThreadNotices([
+    {
+      kind: "idle",
+      threadId: "thr_settings",
+      title: "Install BB Handsfree version",
+      detail: "Updated the notification prompt and reloaded Handsfree.",
+    },
+  ]);
+
+  assert.match(logText, /Updated the notification prompt/);
+  assert.match(instruction, /latest_result: "Updated the notification prompt/);
+  assert.match(instruction, /grounded only in each latest_result/);
+  assert.match(instruction, /Never guess from earlier conversation/);
+});
+
+test("requires reading the thread when a completion has no result", () => {
+  const { instruction } = formatThreadNotices([
+    {
+      kind: "idle",
+      threadId: "thr_missing",
+      title: "Background task",
+      detail: null,
+    },
+  ]);
+
+  assert.match(instruction, /latest_result: unavailable/);
+  assert.match(instruction, /call read_thread with that thread_id before speaking/);
 });
 
 test("stopping during the SDP exchange closes the mic and cancels startup", async () => {

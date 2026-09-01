@@ -66,9 +66,19 @@ function AideVoiceButton() {
 
   // Thread-event notifications (digested; disabled via `notifications` setting).
   useRealtime("aide-thread-event", (payload) => {
-    const event = payload as { kind?: unknown; threadId?: unknown; title?: unknown } | null;
+    const event = payload as {
+      kind?: unknown;
+      threadId?: unknown;
+      title?: unknown;
+      detail?: unknown;
+    } | null;
     if (typeof event?.kind === "string" && typeof event.threadId === "string" && typeof event.title === "string") {
-      voiceAgent.enqueueThreadEvent({ kind: event.kind, threadId: event.threadId, title: event.title });
+      voiceAgent.enqueueThreadEvent({
+        kind: event.kind,
+        threadId: event.threadId,
+        title: event.title,
+        detail: typeof event.detail === "string" ? event.detail : null,
+      });
     }
   });
 
