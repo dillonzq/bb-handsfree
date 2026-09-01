@@ -264,6 +264,16 @@ function truncate(text: string, max = 4000): string {
   return text.length > max ? `${text.slice(0, max)}\n…[truncated]` : text;
 }
 
+/** Compact a completed turn's result for a grounded voice notification. */
+function notificationDetail(detail: string | null, max = 600): string | null {
+  const normalized = detail?.replace(/\s+/g, " ").trim();
+  if (!normalized) return null;
+  if (normalized.length <= max) return normalized;
+  const prefix = normalized.slice(0, max);
+  const sentenceEnd = Math.max(prefix.lastIndexOf(". "), prefix.lastIndexOf("! "), prefix.lastIndexOf("? "));
+  return `${prefix.slice(0, sentenceEnd >= max / 2 ? sentenceEnd + 1 : max).trimEnd()}…`;
+}
+
 /** One installed plugin's contributed `bb` command, as exposed to the voice agent. */
 interface PluginCommandInfo {
   id: string;
@@ -483,7 +493,7 @@ export default async function plugin(bb: BbPluginApi) {
       kind,
       threadId: thread.id,
       title: thread.title ?? "(untitled thread)",
-      detail: detail ? detail.slice(0, 200) : null,
+      detail: notificationDetail(detail),
     });
   }
   bb.events.on("thread.idle", ({ thread, lastAssistantText }) => {
