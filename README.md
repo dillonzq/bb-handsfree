@@ -15,7 +15,7 @@ you.
    npm install
    bb plugin install . --yes
    bb plugin config handsfree set openaiApiKey <your-openai-key>
-   bb plugin reload aide
+   bb plugin reload handsfree
    ```
 
 2. Open any thread (or the New thread screen) in bb. Next to the mic button
@@ -48,7 +48,12 @@ The button has three states:
   commands (curate which with the `pluginCommands` setting)
 
 The agent always knows which thread and project you're looking at — even as
-you navigate mid-conversation — so "this thread" just works.
+you navigate mid-conversation — so "this thread" just works. If a project
+lives on several machines, it checks which and asks before starting work.
+
+A voice session is shared across all your bb windows and devices: the sidebar
+shows a live voice bar (with which device the session came through), and any
+window can pick it up or stop it.
 
 ## Inspecting live threads from the terminal
 
@@ -60,6 +65,7 @@ bb handsfree live            # who's running right now
 bb handsfree live --json     # machine-readable
 bb handsfree read thr_xxxxx  # a thread's status + latest assistant output
 bb handsfree usage           # what your voice sessions cost, per day (estimated)
+bb handsfree stop            # stop an active voice session in any bb window
 ```
 
 Agents discover these commands automatically through bb's plugin-commands
@@ -95,9 +101,9 @@ longer via `bb plugin config`).
 ## Troubleshooting
 
 - **No button?** Composer actions hide in bb's compact layout — widen the
-  window. Also check `bb plugin list` shows `aide … running`.
+  window. Also check `bb plugin list` shows `handsfree … running`.
 - **"needs-configuration"** — set the API key (Quick start step 1).
-- **Connects then drops** — check `bb plugin logs aide -f` while clicking;
+- **Connects then drops** — check `bb plugin logs handsfree -f` while clicking;
   the SDP exchange error (bad key, model name) is logged there.
 - **No audio out** — the first click must come from you (browser autoplay
   rules); if you started it and hear nothing, check system output device.
@@ -115,25 +121,29 @@ data channel) with no native helper — unlike its VS Code sibling
 [CodeAide](../CodeAide), which needs a Swift WebRTC binary.
 
 ```text
-app.tsx    composer button + WebRTC session; composer-draft tools run locally
-app.css    waveform animation
-server.ts  API key + SDP exchange (api.openai.com/v1/realtime/calls),
-           bb tools via bb.sdk, `bb handsfree` CLI
+app.tsx            composer button + sidebar voice bar
+voice-agent.ts     WebRTC session, data channel, tool dispatch
+voice-chrome.tsx   waveform button + session UI; sessions-panel.tsx sessions view
+server.ts          API key + SDP exchange, bb tools via bb.sdk, `bb handsfree` CLI
 ```
+
+More detail: [docs/handsfree-voice-architecture.md](docs/handsfree-voice-architecture.md)
+and [docs/handsfree-voice-scenarios.md](docs/handsfree-voice-scenarios.md).
 
 Tool-call flow: model → data channel → `app.tsx` → plugin RPC `runTool` →
 `bb.sdk` → output back over the data channel (function_call_output +
 response.create).
 
-Voice tools: `get_context`, `list_projects`, `list_live_threads`,
-`list_threads`, `search_threads`, `read_thread`, `focus_thread`, `set_pane`,
-`send_to_thread`, `start_thread`, `stop_thread`, `archive_thread`,
-`rename_thread`, `show_diff`, plus frontend-local `set_composer_text` /
+Voice tools: `get_context`, `list_projects`, `list_machines`,
+`list_live_threads`, `list_threads`, `search_threads`, `read_thread`,
+`focus_thread`, `set_pane`, `send_to_thread`, `start_thread`, `stop_thread`,
+`archive_thread`, `rename_thread`, `show_diff`, `update_instructions`,
+`run_plugin_cli`, plus frontend-local `set_composer_text` /
 `append_composer_text`.
 
 Dev loop:
 
 ```sh
 bb plugin dev          # rebuild + reload on save
-bb plugin logs aide -f # tool traffic and errors
+bb plugin logs handsfree -f # tool traffic and errors
 ```
